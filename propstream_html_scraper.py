@@ -206,42 +206,15 @@ class PropStreamHTMLScraper:
                 f.write(import_response.text)
             logger.info("Saved import page to import_page.html for debugging")
             
-            # Parse page to look for upload form or endpoint
-            import_soup = BeautifulSoup(import_response.text, 'html.parser')
+            # Step 5: Click the "Import List" button
+            logger.info("Clicking 'Import List' button...")
+            import_list_url = f"{self.base_url}/api/contacts/import"
+            import_list_response = self.session.post(import_list_url)
             
-            # Try to find the form or API endpoint for uploads
-            upload_url = None
-            csrf_token = None
+            if import_list_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to click Import List button: {import_list_response.status_code}")
             
-            # 1. Look for form with file input
-            upload_form = import_soup.find('form', {'enctype': 'multipart/form-data'})
-            if upload_form:
-                form_action = upload_form.get('action')
-                if form_action:
-                    upload_url = urljoin(self.base_url, form_action)
-                    logger.info(f"Found upload form with action: {upload_url}")
-                
-                # Look for CSRF token
-                csrf_input = upload_form.find('input', {'name': '_csrf'}) or upload_form.find('input', {'name': 'csrf'})
-                if csrf_input:
-                    csrf_token = csrf_input.get('value')
-            
-            # 2. If no form found, look for JavaScript with upload URL
-            if not upload_url:
-                script_tags = import_soup.find_all('script')
-                for script in script_tags:
-                    if script.string and ('upload' in script.string or 'import' in script.string):
-                        url_match = re.search(r'["\']((?:/api)?/(?:contacts/)?(?:upload|import))["\'"]', script.string)
-                        if url_match:
-                            upload_url = urljoin(self.base_url, url_match.group(1))
-                            logger.info(f"Found upload URL in script: {upload_url}")
-                            break
-            
-            # 3. If still not found, use default API endpoints
-            if not upload_url:
-                # Try common endpoints
-                upload_url = f"{self.base_url}/api/contacts/upload"
-                logger.info(f"Using default upload URL: {upload_url}")
+            time.sleep(1)  # Wait a moment for the page to load
             
             # Prepare the file for upload
             file_name = os.path.basename(file_path)
@@ -253,6 +226,10 @@ class PropStreamHTMLScraper:
             # Create multipart form data for the file upload
             try:
                 from requests_toolbelt.multipart.encoder import MultipartEncoder
+                
+                # Step 6-7: Upload the file
+                logger.info(f"Uploading file: {file_name}...")
+                upload_url = f"{self.base_url}/api/contacts/upload"
                 
                 multipart_data = MultipartEncoder(
                     fields={
@@ -266,11 +243,7 @@ class PropStreamHTMLScraper:
                     'Content-Type': multipart_data.content_type
                 }
                 
-                if csrf_token:
-                    headers['X-CSRF-TOKEN'] = csrf_token
-                
                 # Upload the file
-                logger.info(f"Uploading file to {upload_url}...")
                 upload_response = self.session.post(
                     upload_url,
                     data=multipart_data,
@@ -290,11 +263,7 @@ class PropStreamHTMLScraper:
                     'contentType': content_type
                 }
                 
-                if csrf_token:
-                    data['_csrf'] = csrf_token
-                
                 # Upload the file
-                logger.info(f"Uploading file to {upload_url}...")
                 upload_response = self.session.post(
                     upload_url,
                     files=files,
@@ -310,18 +279,14 @@ class PropStreamHTMLScraper:
             file_id = None
             
             try:
-                content_type = upload_response.headers.get('Content-Type', '')
-                if content_type and 'application/json' in content_type:
-                    upload_data = upload_response.json()
-                    file_id = upload_data.get('id') or upload_data.get('fileId')
-                
-                if not file_id and upload_response.status_code in [200, 201, 202]:
-                    # Try to extract from response URL or text
-                    if 'Location' in upload_response.headers:
-                        location = upload_response.headers['Location']
-                        file_id = location.split('/')[-1]
-                    else:
-                        # Search for ID in response text
+                if upload_response.status_code in [200, 201, 202]:
+                    content_type = upload_response.headers.get('Content-Type', '')
+                    if content_type and 'application/json' in content_type:
+                        upload_data = upload_response.json()
+                        file_id = upload_data.get('id') or upload_data.get('fileId')
+                    
+                    if not file_id:
+                        # Try to extract from response text
                         id_match = re.search(r'"id"[:\s]+"([^"]+)"', upload_response.text)
                         if id_match:
                             file_id = id_match.group(1)
@@ -329,6 +294,9 @@ class PropStreamHTMLScraper:
                             # Generate a timestamp as fallback ID
                             file_id = str(int(time.time()))
                             logger.warning(f"Using timestamp as file ID: {file_id}")
+                else:
+                    logger.error(f"File upload failed with status: {upload_response.status_code}")
+                    return None
             except Exception as e:
                 logger.error(f"Error parsing upload response: {str(e)}")
                 import traceback
@@ -336,21 +304,33 @@ class PropStreamHTMLScraper:
                 file_id = str(int(time.time()))
                 logger.warning(f"Using timestamp as fallback file ID: {file_id}")
             
-            # Now create a group for the uploaded contacts
-            group_name = f"Foreclosures_scraping_{time.strftime('%Y%m%d_%H%M%S')}"
-            logger.info(f"Creating group: {group_name}")
+            # Step 8: Select "Create New" radio button
+            logger.info("Selecting 'Create New' option...")
+            create_new_url = f"{self.base_url}/api/contacts/import/mode"
+            create_new_data = {"mode": "new"}
+            create_new_response = self.session.post(create_new_url, json=create_new_data)
             
-            # Find group creation endpoint
-            group_url = f"{self.base_url}/api/contact-groups"
+            if create_new_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to select Create New option: {create_new_response.status_code}")
+            
+            time.sleep(1)  # Wait a moment
+            
+            # Step 9: Enter group name
+            group_name = f"Foreclosures_scraping_{time.strftime('%Y%m%d_%H%M%S')}"
+            logger.info(f"Setting group name: {group_name}")
+            
+            # Now create a group for the uploaded contacts
+            group_url = f"{self.base_url}/api/contacts/import/save"
             
             # Prepare group creation data
             group_data = {
                 "name": group_name,
                 "fileId": file_id,
-                "type": "new"
+                "mode": "new"
             }
             
-            # Create the group
+            # Step 10: Create the group (Save button)
+            logger.info("Clicking Save button...")
             group_response = self.session.post(
                 group_url,
                 json=group_data
@@ -364,20 +344,24 @@ class PropStreamHTMLScraper:
             # Extract group ID
             group_id = None
             try:
-                content_type = group_response.headers.get('Content-Type', '')
-                if content_type and 'application/json' in content_type:
-                    group_data = group_response.json()
-                    group_id = group_data.get('id') or group_data.get('groupId')
-                
-                if not group_id and group_response.status_code in [200, 201, 202]:
-                    # Try to extract from response text
-                    id_match = re.search(r'"id"[:\s]+"([^"]+)"', group_response.text)
-                    if id_match:
-                        group_id = id_match.group(1)
-                    else:
-                        # Use file ID as fallback
-                        group_id = file_id
-                        logger.warning(f"Using file ID as group ID: {group_id}")
+                if group_response.status_code in [200, 201, 202]:
+                    content_type = group_response.headers.get('Content-Type', '')
+                    if content_type and 'application/json' in content_type:
+                        group_data = group_response.json()
+                        group_id = group_data.get('id') or group_data.get('groupId')
+                    
+                    if not group_id:
+                        # Try to extract from response text
+                        id_match = re.search(r'"id"[:\s]+"([^"]+)"', group_response.text)
+                        if id_match:
+                            group_id = id_match.group(1)
+                        else:
+                            # Use file ID as fallback
+                            group_id = file_id
+                            logger.warning(f"Using file ID as group ID: {group_id}")
+                else:
+                    logger.error(f"Group creation failed with status: {group_response.status_code}")
+                    return None
             except Exception as e:
                 logger.error(f"Error parsing group creation response: {str(e)}")
                 import traceback
@@ -385,7 +369,33 @@ class PropStreamHTMLScraper:
                 group_id = file_id
                 logger.warning(f"Using file ID as fallback group ID: {group_id}")
             
-            logger.info(f"Group '{group_name}' created with ID: {group_id}")
+            # Wait for the import to complete
+            logger.info(f"Waiting for contacts to be imported into group '{group_name}'...")
+            time.sleep(5)  # Wait for contacts to be imported
+            
+            # Verify that contacts were imported
+            contacts_url = f"{self.base_url}/api/contact-groups/{group_id}/contacts"
+            contacts_response = self.session.get(contacts_url)
+            
+            contact_count = 0
+            if contacts_response.status_code == 200:
+                try:
+                    if contacts_response.headers.get('Content-Type', '').startswith('application/json'):
+                        contacts_data = contacts_response.json()
+                        
+                        # Handle different response formats
+                        if 'items' in contacts_data:
+                            contact_count = len(contacts_data['items'])
+                        elif 'contacts' in contacts_data:
+                            contact_count = len(contacts_data['contacts'])
+                        elif isinstance(contacts_data, list):
+                            contact_count = len(contacts_data)
+                        elif 'count' in contacts_data:
+                            contact_count = contacts_data['count']
+                except Exception as e:
+                    logger.warning(f"Error checking contact count: {str(e)}")
+            
+            logger.info(f"Group '{group_name}' created with ID: {group_id} containing {contact_count} contacts")
             return group_id
         except Exception as e:
             logger.error(f"Failed to upload file and create group: {str(e)}")
@@ -421,24 +431,57 @@ class PropStreamHTMLScraper:
         try:
             logger.info(f"Selecting contacts from group {group_id}...")
             
-            # Get available contacts
-            contacts_url = f"{self.base_url}/api/contact-groups/{group_id}/contacts"
+            # Step 12: Click "Select Contacts" button
+            logger.info("Clicking 'Select Contacts' button...")
+            select_contacts_url = f"{self.base_url}/api/skip-tracing/select-contacts"
+            select_contacts_response = self.session.post(select_contacts_url)
+            
+            if select_contacts_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to click Select Contacts button: {select_contacts_response.status_code}")
+            
+            time.sleep(2)  # Wait a moment for the page to load
+            
+            # Step 13: Select the group from dropdown
+            logger.info(f"Selecting group: {group_id}")
+            # Get available groups first to confirm our group exists
+            groups_url = f"{self.base_url}/api/contact-groups"
+            groups_response = self.session.get(groups_url)
+            
+            group_exists = False
+            group_name = ""
+            if groups_response.status_code == 200:
+                try:
+                    groups_data = groups_response.json()
+                    if isinstance(groups_data, list):
+                        for group in groups_data:
+                            if str(group.get('id')) == str(group_id):
+                                group_exists = True
+                                group_name = group.get('name', "")
+                                logger.info(f"Found group: {group_name} with ID {group_id}")
+                                break
+                except Exception as e:
+                    logger.warning(f"Error checking groups: {str(e)}")
+            
+            if not group_exists:
+                logger.warning(f"Group ID {group_id} not found in available groups!")
+            
+            # Select the group
+            select_group_url = f"{self.base_url}/api/skip-tracing/select-group"
+            select_group_data = {"groupId": group_id}
+            select_group_response = self.session.post(select_group_url, json=select_group_data)
+            
+            if select_group_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to select group: {select_group_response.status_code}")
+            
+            time.sleep(2)  # Wait a moment for contacts to load
+            
+            # Get contacts from the selected group
+            contacts_url = f"{self.base_url}/api/skip-tracing/contacts?groupId={group_id}"
             contacts_response = self.session.get(contacts_url)
             
-            if contacts_response.status_code != 200:
-                logger.warning(f"Failed to get contacts directly. Status: {contacts_response.status_code}")
-                # Try alternative method
-                contacts_url = f"{self.base_url}/api/contacts?groupId={group_id}"
-                contacts_response = self.session.get(contacts_url)
-                
-                if contacts_response.status_code != 200:
-                    logger.error(f"Failed to get contacts with alternative method: {contacts_response.status_code}")
-                    return False
-            
-            # Extract contact IDs
             contact_ids = []
-            try:
-                if contacts_response.headers.get('Content-Type', '').startswith('application/json'):
+            if contacts_response.status_code == 200:
+                try:
                     contacts_data = contacts_response.json()
                     
                     # Handle different response formats
@@ -456,77 +499,169 @@ class PropStreamHTMLScraper:
                         contact_id = contact.get('id')
                         if contact_id:
                             contact_ids.append(contact_id)
-                else:
-                    # Try to find contact IDs in HTML response
-                    contacts_soup = BeautifulSoup(contacts_response.text, 'html.parser')
-                    
-                    # Look for elements with data-id attributes
-                    elements_with_id = contacts_soup.select('[data-id]')
-                    for element in elements_with_id:
-                        contact_id = element.get('data-id')
-                        if contact_id:
-                            contact_ids.append(contact_id)
-            except Exception as e:
-                logger.error(f"Error extracting contact IDs: {str(e)}")
-                # If we can't get specific contact IDs, we'll try to use the group as a whole
+                            
+                    logger.info(f"Found {len(contact_ids)} contact IDs from the skip tracing interface")
+                except Exception as e:
+                    logger.error(f"Error extracting contact IDs: {str(e)}")
+            else:
+                logger.warning(f"Failed to get contacts: {contacts_response.status_code}")
                 
-            logger.info(f"Found {len(contact_ids)} contact IDs")
+                # Try alternative method
+                alt_contacts_url = f"{self.base_url}/api/contact-groups/{group_id}/contacts"
+                alt_contacts_response = self.session.get(alt_contacts_url)
+                
+                if alt_contacts_response.status_code == 200:
+                    try:
+                        alt_contacts_data = alt_contacts_response.json()
+                        
+                        # Handle different response formats
+                        if 'items' in alt_contacts_data:
+                            contacts = alt_contacts_data['items']
+                        elif 'contacts' in alt_contacts_data:
+                            contacts = alt_contacts_data['contacts']
+                        elif isinstance(alt_contacts_data, list):
+                            contacts = alt_contacts_data
+                        else:
+                            contacts = []
+                        
+                        # Extract IDs
+                        for contact in contacts:
+                            contact_id = contact.get('id')
+                            if contact_id:
+                                contact_ids.append(contact_id)
+                                
+                        logger.info(f"Found {len(contact_ids)} contact IDs using alternative method")
+                    except Exception as e:
+                        logger.error(f"Error extracting contact IDs with alternative method: {str(e)}")
             
-            # If no contact IDs found but we have a group ID, we'll use the group
+            # If still no contacts found, try to get them from the HTML
             if not contact_ids:
-                logger.warning("No contact IDs found, will use group ID for skip tracing")
+                # Get the skip tracing contact selection page HTML
+                skip_page_url = f"{self.base_url}/skip-tracing/select-contacts"
+                skip_page_response = self.session.get(skip_page_url)
+                
+                if skip_page_response.status_code == 200:
+                    skip_soup = BeautifulSoup(skip_page_response.text, 'html.parser')
+                    
+                    # Save the skip tracing contacts page for debugging
+                    with open("skip_contacts_page.html", "w", encoding="utf-8") as f:
+                        f.write(skip_page_response.text)
+                    
+                    # Look for elements with data-id attributes or checkboxes
+                    checkboxes = skip_soup.select('input[type="checkbox"]')
+                    for checkbox in checkboxes:
+                        parent = checkbox.find_parent('tr') or checkbox.find_parent('div')
+                        if parent:
+                            contact_id = parent.get('data-id') or parent.get('id')
+                            if contact_id and contact_id not in contact_ids:
+                                contact_ids.append(contact_id)
+                    
+                    if contact_ids:
+                        logger.info(f"Found {len(contact_ids)} contact IDs from HTML parsing")
+            
+            # Step 14: Mark all checkmarks (select all contacts)
+            logger.info("Selecting all contacts")
+            select_all_url = f"{self.base_url}/api/skip-tracing/select-all"
+            select_all_data = {"groupId": group_id}
+            select_all_response = self.session.post(select_all_url, json=select_all_data)
+            
+            if select_all_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to select all contacts: {select_all_response.status_code}")
+            
+            time.sleep(2)  # Wait a moment for selection to process
+            
+            # Step 15: Click "Add Selected Contacts"
+            logger.info("Clicking 'Add Selected Contacts' button...")
+            add_selected_url = f"{self.base_url}/api/skip-tracing/add-selected"
+            add_selected_data = {"groupId": group_id}
+            if contact_ids:
+                add_selected_data["contactIds"] = contact_ids
+            add_selected_response = self.session.post(add_selected_url, json=add_selected_data)
+            
+            if add_selected_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to add selected contacts: {add_selected_response.status_code}")
+            
+            time.sleep(2)  # Wait a moment for contacts to be added
+            
+            # Step 16: Click "Done"
+            logger.info("Clicking 'Done' button...")
+            done_button_url = f"{self.base_url}/api/skip-tracing/done"
+            done_button_response = self.session.post(done_button_url)
+            
+            if done_button_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to click Done button: {done_button_response.status_code}")
+            
+            # Even if we couldn't get specific contact IDs, we'll use the group
+            if not contact_ids:
+                logger.warning("No specific contact IDs found, will use group ID for skip tracing")
+            else:
+                logger.info(f"Successfully selected {len(contact_ids)} contacts for skip tracing")
             
             return group_id, contact_ids
         except Exception as e:
             logger.error(f"Failed to select contacts: {str(e)}")
-            return None, []
+            import traceback
+            logger.error(traceback.format_exc())
+            return group_id, []
     
     def place_skip_tracing_order(self, group_id, contact_ids=None):
         """Place skip tracing order for the selected contacts"""
         try:
             logger.info("Placing skip tracing order...")
             
-            # Prepare the order data
-            order_data = {
-                "groupId": group_id,
-                "type": "skiptracing"
-            }
-            
-            # Add contact IDs if we have them
+            # Step 17: Click the "Next" button
+            logger.info("Clicking 'Next' button...")
+            next_button_url = f"{self.base_url}/api/skip-tracing/next"
+            next_data = {"groupId": group_id}
             if contact_ids:
-                order_data["contactIds"] = contact_ids
+                next_data["contactIds"] = contact_ids
+            next_response = self.session.post(next_button_url, json=next_data)
             
-            # Place the order
-            order_url = f"{self.base_url}/api/skip-tracing/orders"
-            order_response = self.session.post(
-                order_url,
-                json=order_data
-            )
+            if next_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to click Next button: {next_response.status_code}")
             
-            if order_response.status_code not in [200, 201, 202]:
-                logger.warning(f"Failed to place order with primary URL: {order_response.status_code}")
+            time.sleep(1)  # Wait a moment for the page to load
+            
+            # Step 18: Click the "Place Order" button
+            logger.info("Clicking 'Place Order' button...")
+            place_order_url = f"{self.base_url}/api/skip-tracing/place-order"
+            place_order_data = {"groupId": group_id}
+            if contact_ids:
+                place_order_data["contactIds"] = contact_ids
+            place_order_response = self.session.post(place_order_url, json=place_order_data)
+            
+            if place_order_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to click Place Order button: {place_order_response.status_code}")
                 
                 # Try alternative endpoint
-                alt_order_url = f"{self.base_url}/api/orders/skiptracing"
-                order_response = self.session.post(
-                    alt_order_url,
-                    json=order_data
-                )
+                alt_place_order_url = f"{self.base_url}/api/orders/skiptracing"
+                place_order_response = self.session.post(alt_place_order_url, json=place_order_data)
                 
-                if order_response.status_code not in [200, 201, 202]:
-                    logger.error(f"Failed to place order with alternative URL: {order_response.status_code}")
+                if place_order_response.status_code not in [200, 201, 202]:
+                    logger.error(f"Failed to place order with alternative URL: {place_order_response.status_code}")
                     return None
             
-            # Extract order ID
+            time.sleep(1)  # Wait a moment for the page to load
+            
+            # Step 19: Click the "I Accept" button
+            logger.info("Clicking 'I Accept' button...")
+            accept_url = f"{self.base_url}/api/skip-tracing/accept"
+            accept_data = {"groupId": group_id}
+            accept_response = self.session.post(accept_url, json=accept_data)
+            
+            if accept_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to click I Accept button: {accept_response.status_code}")
+            
+            # Extract order ID from the response
             order_id = None
             try:
-                if order_response.headers.get('Content-Type', '').startswith('application/json'):
-                    order_data = order_response.json()
+                if place_order_response.headers.get('Content-Type', '').startswith('application/json'):
+                    order_data = place_order_response.json()
                     order_id = order_data.get('id') or order_data.get('orderId')
                 
-                if not order_id and order_response.status_code in [200, 201, 202]:
+                if not order_id and place_order_response.status_code in [200, 201, 202]:
                     # Try to extract from response text
-                    id_match = re.search(r'"id"[:\s]+"([^"]+)"', order_response.text)
+                    id_match = re.search(r'"id"[:\s]+"([^"]+)"', place_order_response.text)
                     if id_match:
                         order_id = id_match.group(1)
                     else:
@@ -544,8 +679,8 @@ class PropStreamHTMLScraper:
             logger.error(f"Failed to place skip tracing order: {str(e)}")
             return None
     
-    def wait_for_order_completion(self, order_id, max_retries=3, wait_interval=10):
-        """Wait for skip tracing order to complete"""
+    def wait_for_order_completion(self, order_id, max_retries=2, wait_interval=10):
+        """Wait for skip tracing order to complete and handle UI interactions"""
         try:
             logger.info("Waiting for order to complete...")
             
@@ -578,6 +713,28 @@ class PropStreamHTMLScraper:
                         
                         if order_status in ["completed", "done", "finished", "success"]:
                             logger.info(f"Order completed with status: {order_status}")
+                            
+                            # Handle UI interactions after order completion
+                            # 1. Click OK button
+                            ok_button_url = f"{self.base_url}/api/contacts/import/complete"
+                            ok_response = self.session.post(ok_button_url)
+                            if ok_response.status_code != 200:
+                                logger.warning("Failed to click OK button")
+                            
+                            # 2. Set list name
+                            list_name = f"{time.strftime('%m/%d/%Y')} - {order_id}"
+                            list_name_url = f"{self.base_url}/api/contacts/import/name"
+                            list_name_data = {"name": list_name}
+                            list_name_response = self.session.post(list_name_url, json=list_name_data)
+                            if list_name_response.status_code != 200:
+                                logger.warning("Failed to set list name")
+                            
+                            # 3. Click Done button
+                            done_button_url = f"{self.base_url}/api/contacts/import/finish"
+                            done_response = self.session.post(done_button_url)
+                            if done_response.status_code != 200:
+                                logger.warning("Failed to click Done button")
+                            
                             return True
                         elif order_status in ["failed", "cancelled", "error", "timeout"]:
                             logger.error(f"Order failed with status: {order_status}")
@@ -593,6 +750,28 @@ class PropStreamHTMLScraper:
                             status_text = status_element.strip().lower()
                             if any(s in status_text for s in ["completed", "done", "finished", "success"]):
                                 logger.info(f"Order completed with status indicator: {status_text}")
+                                
+                                # Handle UI interactions after order completion
+                                # 1. Click OK button
+                                ok_button_url = f"{self.base_url}/api/contacts/import/complete"
+                                ok_response = self.session.post(ok_button_url)
+                                if ok_response.status_code != 200:
+                                    logger.warning("Failed to click OK button")
+                                
+                                # 2. Set list name
+                                list_name = f"{time.strftime('%m/%d/%Y')} - {order_id}"
+                                list_name_url = f"{self.base_url}/api/contacts/import/name"
+                                list_name_data = {"name": list_name}
+                                list_name_response = self.session.post(list_name_url, json=list_name_data)
+                                if list_name_response.status_code != 200:
+                                    logger.warning("Failed to set list name")
+                                
+                                # 3. Click Done button
+                                done_button_url = f"{self.base_url}/api/contacts/import/finish"
+                                done_response = self.session.post(done_button_url)
+                                if done_response.status_code != 200:
+                                    logger.warning("Failed to click Done button")
+                                
                                 return True
                             elif any(s in status_text for s in ["failed", "cancelled", "error", "timeout"]):
                                 logger.error(f"Order failed with status indicator: {status_text}")
@@ -615,284 +794,192 @@ class PropStreamHTMLScraper:
         try:
             logger.info("Fetching contact data...")
             
-            # Try several potential endpoints for contact data
-            endpoints = [
-                f"{self.base_url}/api/contacts?groupId={group_id}",
-                f"{self.base_url}/api/contact-groups/{group_id}/contacts",
-                f"{self.base_url}/api/skip-tracing/results?groupId={group_id}"
-            ]
+            # Navigate to the contact page
+            contact_url = f"{self.base_url}/contacts"
+            contact_response = self.session.get(contact_url)
             
-            for endpoint in endpoints:
-                logger.info(f"Trying endpoint: {endpoint}")
-                response = self.session.get(endpoint)
-                
-                if response.status_code != 200:
-                    logger.warning(f"Failed to get contacts from {endpoint}: {response.status_code}")
-                    continue
-                
-                try:
-                    content_type = response.headers.get('Content-Type', '')
-                    if content_type and 'application/json' in content_type:
-                        # Parse JSON response
-                        data = response.json()
-                        
-                        # Try different JSON structures
-                        contacts = None
-                        if "items" in data:
-                            contacts = data.get("items", [])
-                        elif "contacts" in data:
-                            contacts = data.get("contacts", [])
-                        elif "results" in data:
-                            contacts = data.get("results", [])
-                        elif isinstance(data, list):
-                            contacts = data
-                        
-                        if contacts:
-                            logger.info(f"Found {len(contacts)} contacts")
-                            
-                            # Extract contact information
-                            for contact in contacts:
-                                # Try different field naming patterns for name
-                                full_name = (
-                                    contact.get('fullName') or 
-                                    contact.get('name') or 
-                                    contact.get('contactName') or
-                                    contact.get('customerName') or
-                                    ""
-                                )
-                                
-                                # Try to parse full name into components
-                                name_parts = full_name.split()
-                                first_name = name_parts[0] if len(name_parts) > 0 else ""
-                                last_name = name_parts[-1] if len(name_parts) > 1 else ""
-                                middle_name = " ".join(name_parts[1:-1]) if len(name_parts) > 2 else ""
-                                
-                                # Try various fields for phone numbers
-                                phones = []
-                                mobile_phones = []
-                                landlines = []
-                                
-                                # Collect all possible phone numbers
-                                for phone_field in ['phoneNumber', 'phone', 'primaryPhone', 'contactPhone', 
-                                                   'customerPhone', 'mobilePhone', 'cellPhone', 'workPhone',
-                                                   'homePhone', 'landline']:
-                                    phone_value = contact.get(phone_field)
-                                    if phone_value and phone_value.strip():
-                                        # Try to categorize phones if possible
-                                        if phone_field in ['mobilePhone', 'cellPhone']:
-                                            mobile_phones.append(phone_value.strip())
-                                        elif phone_field in ['landline', 'homePhone', 'workPhone']:
-                                            landlines.append(phone_value.strip())
-                                        else:
-                                            phones.append(phone_value.strip())
-                                
-                                # Try to extract email
-                                email = (
-                                    contact.get('email') or 
-                                    contact.get('emailAddress') or
-                                    contact.get('contactEmail') or
-                                    contact.get('customerEmail') or
-                                    ""
-                                )
-                                
-                                # Add to scraped data
-                                self.scraped_data.append({
-                                    "first_name": first_name,
-                                    "middle_name": middle_name,
-                                    "last_name": last_name,
-                                    "full_name": full_name,  # Keep full name for matching
-                                    "phones": phones,
-                                    "mobile_phones": mobile_phones,
-                                    "landlines": landlines,
-                                    "email": email
-                                })
-                            
-                            if self.scraped_data:
-                                logger.info(f"Successfully extracted {len(self.scraped_data)} contacts")
-                                return True
-                    else:
-                        # If response is HTML, parse it for contacts
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        
-                        # Look for tables
-                        tables = soup.find_all('table')
-                        if tables:
-                            for table in tables:
-                                rows = table.find_all('tr')
-                                
-                                # Skip header row
-                                for row in rows[1:]:
-                                    cells = row.find_all('td')
-                                    if len(cells) >= 3:
-                                        full_name = cells[0].text.strip()
-                                        phone = cells[1].text.strip()
-                                        email = cells[2].text.strip()
-                                        
-                                        # Try to parse full name into components
-                                        name_parts = full_name.split()
-                                        first_name = name_parts[0] if len(name_parts) > 0 else ""
-                                        last_name = name_parts[-1] if len(name_parts) > 1 else ""
-                                        middle_name = " ".join(name_parts[1:-1]) if len(name_parts) > 2 else ""
-                                        
-                                        if full_name or phone or email:
-                                            self.scraped_data.append({
-                                                "first_name": first_name,
-                                                "middle_name": middle_name,
-                                                "last_name": last_name,
-                                                "full_name": full_name,  # Keep full name for matching
-                                                "phones": [phone] if phone else [],
-                                                "mobile_phones": [],
-                                                "landlines": [],
-                                                "email": email
-                                            })
-                            
-                            if self.scraped_data:
-                                logger.info(f"Successfully extracted {len(self.scraped_data)} contacts from HTML table")
-                                return True
-                        
-                        # No tables found, look for structured data
-                        else:
-                            # Look for email addresses and phone numbers in the page
-                            email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-                            phone_pattern = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
-                            
-                            # Find all emails
-                            emails = []
-                            for email_match in email_pattern.finditer(response.text):
-                                emails.append(email_match.group(0))
-                            
-                            # Find all phones
-                            phones = []
-                            for phone_match in phone_pattern.finditer(response.text):
-                                phones.append(phone_match.group(0))
-                            
-                            # If we have roughly the same number of emails and phones, pair them
-                            if emails and phones and abs(len(emails) - len(phones)) <= min(len(emails), len(phones)) // 2:
-                                for i in range(min(len(emails), len(phones))):
-                                    self.scraped_data.append({
-                                        "first_name": "",  # Can't reliably parse names
-                                        "middle_name": "",
-                                        "last_name": "",
-                                        "full_name": "",
-                                        "phones": [phones[i]],
-                                        "mobile_phones": [],
-                                        "landlines": [],
-                                        "email": emails[i]
-                                    })
-                                
-                                if self.scraped_data:
-                                    logger.info(f"Successfully paired {len(self.scraped_data)} emails and phones")
-                                    return True
-                            
-                            # Otherwise, just log what we found
-                            else:
-                                logger.info(f"Found {len(emails)} emails and {len(phones)} phones, but couldn't reliably pair them")
-                                for email in emails:
-                                    self.scraped_data.append({
-                                        "first_name": "",
-                                        "middle_name": "",
-                                        "last_name": "",
-                                        "full_name": "",
-                                        "phones": [],
-                                        "mobile_phones": [],
-                                        "landlines": [],
-                                        "email": email
-                                    })
-                                
-                                for phone in phones:
-                                    self.scraped_data.append({
-                                        "first_name": "",
-                                        "middle_name": "",
-                                        "last_name": "",
-                                        "full_name": "",
-                                        "phones": [phone],
-                                        "mobile_phones": [],
-                                        "landlines": [],
-                                        "email": ""
-                                    })
-                                
-                                if self.scraped_data:
-                                    logger.info(f"Added {len(self.scraped_data)} unpaired contacts")
-                                    return True
-                except Exception as e:
-                    logger.error(f"Error processing response from {endpoint}: {str(e)}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+            if contact_response.status_code != 200:
+                logger.error(f"Failed to access contact page: {contact_response.status_code}")
+                return False
             
-            # If we've tried all endpoints and still have no data, try the main contacts page
-            try:
-                contacts_page_url = f"{self.base_url}/contacts"
-                contacts_page = self.session.get(contacts_page_url)
-                
-                if contacts_page.status_code == 200:
-                    # Save the page for debugging
-                    with open("contacts_page.html", "w", encoding="utf-8") as f:
-                        f.write(contacts_page.text)
-                    
-                    logger.info("Saved contacts page to contacts_page.html")
-                    
-                    # Parse for contact data
-                    soup = BeautifulSoup(contacts_page.text, 'html.parser')
-                    
-                    # Look for email addresses and phone numbers in the page
-                    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-                    phone_pattern = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
-                    
-                    # Find all text nodes
-                    text_elements = soup.find_all(string=True)
-                    
-                    for element in text_elements:
-                        text = element.strip()
-                        if not text:
-                            continue
-                        
-                        email_match = email_pattern.search(text)
-                        phone_match = phone_pattern.search(text)
-                        
-                        if email_match or phone_match:
-                            email = email_match.group(0) if email_match else ""
-                            phone = phone_match.group(0) if phone_match else ""
-                            
-                            # Extract name by removing email and phone
-                            full_name = text
-                            if email:
-                                full_name = full_name.replace(email, "")
-                            if phone:
-                                full_name = full_name.replace(phone, "")
-                            full_name = re.sub(r'\s+', ' ', full_name).strip()
-                            
-                            # Parse name components if possible
-                            name_parts = full_name.split()
-                            first_name = name_parts[0] if len(name_parts) > 0 else ""
-                            last_name = name_parts[-1] if len(name_parts) > 1 else ""
-                            middle_name = " ".join(name_parts[1:-1]) if len(name_parts) > 2 else ""
-                            
-                            if email or phone:
-                                self.scraped_data.append({
-                                    "first_name": first_name,
-                                    "middle_name": middle_name,
-                                    "last_name": last_name,
-                                    "full_name": full_name,
-                                    "phones": [phone] if phone else [],
-                                    "mobile_phones": [],
-                                    "landlines": [],
-                                    "email": email
-                                })
-                    
-                    if self.scraped_data:
-                        logger.info(f"Extracted {len(self.scraped_data)} contacts from contacts page")
-                        return True
-            except Exception as e:
-                logger.error(f"Error processing contacts page: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
+            # Save the contact page for debugging
+            with open("contact_page.html", "w", encoding="utf-8") as f:
+                f.write(contact_response.text)
+            logger.info("Saved contact page to contact_page.html for debugging")
             
-            # If we still have no data, report failure
-            if not self.scraped_data:
-                logger.error("Failed to extract any contact data from all sources")
+            # Get list of all available lists including skip tracing lists
+            lists_url = f"{self.base_url}/api/contacts/lists"
+            lists_response = self.session.get(lists_url)
+            
+            if lists_response.status_code != 200:
+                logger.error(f"Failed to get contact lists: {lists_response.status_code}")
                 return False
                 
-            return True
+            # Find our list - it should be named with the date and order ID
+            # Format is typically "MM/DD/YYYY - order_id"
+            target_list_id = None
+            today_date = time.strftime("%m/%d/%Y")
+            
+            try:
+                lists_data = lists_response.json()
+                
+                # Look for our list with date pattern
+                for list_item in lists_data:
+                    list_name = list_item.get('name', '')
+                    if today_date in list_name and (str(group_id) in list_name or "skip" in list_name.lower()):
+                        target_list_id = list_item.get('id')
+                        logger.info(f"Found target list: {list_name} with ID {target_list_id}")
+                        break
+                        
+                # If not found with today's date, look for any skip tracing list
+                if not target_list_id:
+                    for list_item in lists_data:
+                        list_name = list_item.get('name', '')
+                        list_type = list_item.get('type', '')
+                        if list_type == 'skipTracing' or 'skip' in list_name.lower():
+                            target_list_id = list_item.get('id')
+                            logger.info(f"Found skip tracing list: {list_name} with ID {target_list_id}")
+                            break
+            except Exception as e:
+                logger.error(f"Error finding target list: {str(e)}")
+                
+            if not target_list_id:
+                logger.error("Could not find the skip tracing results list")
+                return False
+                
+            # Select the list to view its data
+            select_list_url = f"{self.base_url}/api/contacts/select-list"
+            select_data = {"listId": target_list_id}
+            select_response = self.session.post(select_list_url, json=select_data)
+            
+            if select_response.status_code != 200:
+                logger.warning(f"Failed to select list: {select_response.status_code}")
+                
+            # Wait a moment for the data to load
+            time.sleep(3)
+            
+            # Get the contact data for the selected list
+            list_contacts_url = f"{self.base_url}/api/contacts?listId={target_list_id}"
+            list_contacts_response = self.session.get(list_contacts_url)
+            
+            if list_contacts_response.status_code != 200:
+                logger.error(f"Failed to get contacts for list: {list_contacts_response.status_code}")
+                return False
+                
+            # Parse the contact data
+            try:
+                contacts_data = []
+                contact_items = []
+                
+                # Try to get the contact data
+                if list_contacts_response.headers.get('Content-Type', '').startswith('application/json'):
+                    list_data = list_contacts_response.json()
+                    
+                    # Handle different response formats
+                    if 'items' in list_data:
+                        contact_items = list_data['items']
+                    elif 'contacts' in list_data:
+                        contact_items = list_data['contacts']
+                    elif isinstance(list_data, list):
+                        contact_items = list_data
+                        
+                    logger.info(f"Found {len(contact_items)} contacts in the list")
+                    
+                    # Extract the relevant data from each contact
+                    for contact in contact_items:
+                        contact_info = {}
+                        
+                        # Get mobile phone
+                        mobile_phone = contact.get('mobilePhone', '')
+                        if mobile_phone:
+                            contact_info['mobile_phones'] = [mobile_phone]
+                        
+                        # Get landline
+                        landline = contact.get('landlinePhone', '')
+                        if landline:
+                            contact_info['landlines'] = [landline]
+                        
+                        # Get phone
+                        phone = contact.get('phone', '')
+                        if phone:
+                            contact_info['phones'] = [phone]
+                        
+                        # Get email
+                        email = contact.get('email', '')
+                        if email:
+                            contact_info['email'] = email
+                            
+                        # Get name information
+                        contact_info['first_name'] = contact.get('firstName', '')
+                        contact_info['middle_name'] = contact.get('middleName', '')
+                        contact_info['last_name'] = contact.get('lastName', '')
+                        
+                        if contact_info:
+                            contacts_data.append(contact_info)
+                
+                if contacts_data:
+                    self.scraped_data = contacts_data
+                    logger.info(f"Successfully extracted data for {len(contacts_data)} contacts")
+                    return True
+                else:
+                    logger.error("No contact data found in API response")
+                    
+                    # If API data extraction failed, try HTML extraction as a fallback
+                    # Refresh the contact page after selecting the list
+                    updated_contact_url = f"{self.base_url}/contacts?listId={target_list_id}"
+                    updated_contact_response = self.session.get(updated_contact_url)
+                    
+                    if updated_contact_response.status_code == 200:
+                        updated_contact_soup = BeautifulSoup(updated_contact_response.text, 'html.parser')
+                        
+                        # Save the updated contact page for debugging
+                        with open("updated_contact_page.html", "w", encoding="utf-8") as f:
+                            f.write(updated_contact_response.text)
+                            
+                        # Find all contact rows in the HTML
+                        contact_rows = updated_contact_soup.select('div.ag-center-cols-clipper > div > div > div')
+                        
+                        for row in contact_rows:
+                            contact = {}
+                            
+                            # Extract mobile phone
+                            mobile_phone = row.select_one('#cell-mobilePhone-2338')
+                            if mobile_phone:
+                                contact['mobile_phones'] = [mobile_phone.text.strip()]
+                            
+                            # Extract landline
+                            landline = row.select_one('#cell-landlinePhone-2339')
+                            if landline:
+                                contact['landlines'] = [landline.text.strip()]
+                            
+                            # Extract phone (from the 4th column)
+                            phone = row.select_one('div:nth-child(4)')
+                            if phone:
+                                contact['phones'] = [phone.text.strip()]
+                            
+                            # Extract email (from the 5th column)
+                            email = row.select_one('div:nth-child(5)')
+                            if email:
+                                contact['email'] = email.text.strip()
+                            
+                            if contact:
+                                contacts_data.append(contact)
+                        
+                        if contacts_data:
+                            self.scraped_data = contacts_data
+                            logger.info(f"Successfully extracted data for {len(contacts_data)} contacts via HTML parsing")
+                            return True
+                        else:
+                            logger.error("No contact data found in HTML parsing")
+                            return False
+                    else:
+                        logger.error("No contact data found")
+                        return False
+            except Exception as e:
+                logger.error(f"Error extracting contact data: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return False
         except Exception as e:
             logger.error(f"Failed to get contact data: {str(e)}")
             import traceback
