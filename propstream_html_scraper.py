@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 class PropStreamHTMLScraper:
     def __init__(self):
-        self.username = "mikerossgrandrapidsrealty@gmail.com"
-        # Get password from environment variable instead of hardcoding
+        # Get credentials from environment variables
+        self.username = os.environ.get("PROPSTREAM_USERNAME")
         self.password = os.environ.get("PROPSTREAM_PASSWORD")
         self.base_url = "https://app.propstream.com"
         self.login_url = "https://login.propstream.com/"

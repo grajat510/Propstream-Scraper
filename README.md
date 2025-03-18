@@ -26,9 +26,10 @@ This Python script automates the process of logging into PropStream.com, uploadi
 pip install -r requirements.txt
 ```
 
-3. Create a `.env` file in the root directory with your PropStream password:
+3. Create a `.env` file in the root directory with your PropStream credentials:
 
 ```
+PROPSTREAM_USERNAME=your_email@example.com
 PROPSTREAM_PASSWORD=your_password_here
 ```
 
@@ -56,7 +57,7 @@ Unlike Selenium-based automation, this script:
 
 ## Important Notes
 
-- The script uses your PropStream credentials (username is hardcoded, password is in .env file)
+- The script uses your PropStream credentials from the .env file
 - You must have a valid PropStream subscription for this script to work
 - The script may need adjustments if PropStream changes their website structure or API endpoints
 - Never commit your .env file to git repositories
