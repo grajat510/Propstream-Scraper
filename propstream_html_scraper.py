@@ -34,6 +34,7 @@ class PropStreamHTMLScraper:
         self.login_url = "https://login.propstream.com/"
         self.session = requests.Session()
         self.scraped_data = []
+        self.uploaded_file_path = None  # Store the path to the uploaded file
         self.setup_session()
         
     def setup_session(self):
@@ -177,6 +178,9 @@ class PropStreamHTMLScraper:
             if not file_path:
                 logger.warning("No file selected. Aborting operation.")
                 return None
+            
+            # Store the file path as an instance variable for later use
+            self.uploaded_file_path = file_path
                 
             logger.info(f"Selected file: {file_path}")
             return file_path
@@ -540,7 +544,7 @@ class PropStreamHTMLScraper:
             logger.error(f"Failed to place skip tracing order: {str(e)}")
             return None
     
-    def wait_for_order_completion(self, order_id, max_retries=20, wait_interval=10):
+    def wait_for_order_completion(self, order_id, max_retries=3, wait_interval=10):
         """Wait for skip tracing order to complete"""
         try:
             logger.info("Waiting for order to complete...")
@@ -648,8 +652,8 @@ class PropStreamHTMLScraper:
                             
                             # Extract contact information
                             for contact in contacts:
-                                # Try different field naming patterns
-                                name = (
+                                # Try different field naming patterns for name
+                                full_name = (
                                     contact.get('fullName') or 
                                     contact.get('name') or 
                                     contact.get('contactName') or
@@ -657,15 +661,32 @@ class PropStreamHTMLScraper:
                                     ""
                                 )
                                 
-                                phone = (
-                                    contact.get('phoneNumber') or 
-                                    contact.get('phone') or 
-                                    contact.get('primaryPhone') or
-                                    contact.get('contactPhone') or
-                                    contact.get('customerPhone') or
-                                    ""
-                                )
+                                # Try to parse full name into components
+                                name_parts = full_name.split()
+                                first_name = name_parts[0] if len(name_parts) > 0 else ""
+                                last_name = name_parts[-1] if len(name_parts) > 1 else ""
+                                middle_name = " ".join(name_parts[1:-1]) if len(name_parts) > 2 else ""
                                 
+                                # Try various fields for phone numbers
+                                phones = []
+                                mobile_phones = []
+                                landlines = []
+                                
+                                # Collect all possible phone numbers
+                                for phone_field in ['phoneNumber', 'phone', 'primaryPhone', 'contactPhone', 
+                                                   'customerPhone', 'mobilePhone', 'cellPhone', 'workPhone',
+                                                   'homePhone', 'landline']:
+                                    phone_value = contact.get(phone_field)
+                                    if phone_value and phone_value.strip():
+                                        # Try to categorize phones if possible
+                                        if phone_field in ['mobilePhone', 'cellPhone']:
+                                            mobile_phones.append(phone_value.strip())
+                                        elif phone_field in ['landline', 'homePhone', 'workPhone']:
+                                            landlines.append(phone_value.strip())
+                                        else:
+                                            phones.append(phone_value.strip())
+                                
+                                # Try to extract email
                                 email = (
                                     contact.get('email') or 
                                     contact.get('emailAddress') or
@@ -674,12 +695,17 @@ class PropStreamHTMLScraper:
                                     ""
                                 )
                                 
-                                if name or phone or email:
-                                    self.scraped_data.append({
-                                        "name": name,
-                                        "phone": phone,
-                                        "email": email
-                                    })
+                                # Add to scraped data
+                                self.scraped_data.append({
+                                    "first_name": first_name,
+                                    "middle_name": middle_name,
+                                    "last_name": last_name,
+                                    "full_name": full_name,  # Keep full name for matching
+                                    "phones": phones,
+                                    "mobile_phones": mobile_phones,
+                                    "landlines": landlines,
+                                    "email": email
+                                })
                             
                             if self.scraped_data:
                                 logger.info(f"Successfully extracted {len(self.scraped_data)} contacts")
@@ -698,14 +724,25 @@ class PropStreamHTMLScraper:
                                 for row in rows[1:]:
                                     cells = row.find_all('td')
                                     if len(cells) >= 3:
-                                        name = cells[0].text.strip()
+                                        full_name = cells[0].text.strip()
                                         phone = cells[1].text.strip()
                                         email = cells[2].text.strip()
                                         
-                                        if name or phone or email:
+                                        # Try to parse full name into components
+                                        name_parts = full_name.split()
+                                        first_name = name_parts[0] if len(name_parts) > 0 else ""
+                                        last_name = name_parts[-1] if len(name_parts) > 1 else ""
+                                        middle_name = " ".join(name_parts[1:-1]) if len(name_parts) > 2 else ""
+                                        
+                                        if full_name or phone or email:
                                             self.scraped_data.append({
-                                                "name": name,
-                                                "phone": phone,
+                                                "first_name": first_name,
+                                                "middle_name": middle_name,
+                                                "last_name": last_name,
+                                                "full_name": full_name,  # Keep full name for matching
+                                                "phones": [phone] if phone else [],
+                                                "mobile_phones": [],
+                                                "landlines": [],
                                                 "email": email
                                             })
                             
@@ -733,8 +770,13 @@ class PropStreamHTMLScraper:
                             if emails and phones and abs(len(emails) - len(phones)) <= min(len(emails), len(phones)) // 2:
                                 for i in range(min(len(emails), len(phones))):
                                     self.scraped_data.append({
-                                        "name": "",  # Can't reliably match names
-                                        "phone": phones[i],
+                                        "first_name": "",  # Can't reliably parse names
+                                        "middle_name": "",
+                                        "last_name": "",
+                                        "full_name": "",
+                                        "phones": [phones[i]],
+                                        "mobile_phones": [],
+                                        "landlines": [],
                                         "email": emails[i]
                                     })
                                 
@@ -747,15 +789,25 @@ class PropStreamHTMLScraper:
                                 logger.info(f"Found {len(emails)} emails and {len(phones)} phones, but couldn't reliably pair them")
                                 for email in emails:
                                     self.scraped_data.append({
-                                        "name": "",
-                                        "phone": "",
+                                        "first_name": "",
+                                        "middle_name": "",
+                                        "last_name": "",
+                                        "full_name": "",
+                                        "phones": [],
+                                        "mobile_phones": [],
+                                        "landlines": [],
                                         "email": email
                                     })
                                 
                                 for phone in phones:
                                     self.scraped_data.append({
-                                        "name": "",
-                                        "phone": phone,
+                                        "first_name": "",
+                                        "middle_name": "",
+                                        "last_name": "",
+                                        "full_name": "",
+                                        "phones": [phone],
+                                        "mobile_phones": [],
+                                        "landlines": [],
                                         "email": ""
                                     })
                                 
@@ -802,17 +854,28 @@ class PropStreamHTMLScraper:
                             phone = phone_match.group(0) if phone_match else ""
                             
                             # Extract name by removing email and phone
-                            name = text
+                            full_name = text
                             if email:
-                                name = name.replace(email, "")
+                                full_name = full_name.replace(email, "")
                             if phone:
-                                name = name.replace(phone, "")
-                            name = re.sub(r'\s+', ' ', name).strip()
+                                full_name = full_name.replace(phone, "")
+                            full_name = re.sub(r'\s+', ' ', full_name).strip()
+                            
+                            # Parse name components if possible
+                            name_parts = full_name.split()
+                            first_name = name_parts[0] if len(name_parts) > 0 else ""
+                            last_name = name_parts[-1] if len(name_parts) > 1 else ""
+                            middle_name = " ".join(name_parts[1:-1]) if len(name_parts) > 2 else ""
                             
                             if email or phone:
                                 self.scraped_data.append({
-                                    "name": name,
-                                    "phone": phone,
+                                    "first_name": first_name,
+                                    "middle_name": middle_name,
+                                    "last_name": last_name,
+                                    "full_name": full_name,
+                                    "phones": [phone] if phone else [],
+                                    "mobile_phones": [],
+                                    "landlines": [],
                                     "email": email
                                 })
                     
@@ -836,35 +899,277 @@ class PropStreamHTMLScraper:
             logger.error(traceback.format_exc())
             return False
     
-    def save_data_to_csv(self, output_file="propstream_contacts.csv"):
-        """Save the scraped data to a CSV file"""
+    def save_data_to_csv(self, output_file=None):
+        """
+        Save the scraped data back to the original CSV file, adding new columns
+        for phone, mobile phone, landline, email, and update timestamp
+        """
         if not self.scraped_data:
             logger.warning("No data to save!")
             return False
             
         try:
-            # Deduplicate data based on email (most unique identifier)
-            unique_emails = set()
-            deduplicated_data = []
-            
-            for entry in self.scraped_data:
-                email = entry.get("email", "")
-                if email and email in unique_emails:
-                    continue
-                if email:
-                    unique_emails.add(email)
-                deduplicated_data.append(entry)
-            
-            # Save to CSV
-            with open(output_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=["name", "phone", "email"])
-                writer.writeheader()
-                writer.writerows(deduplicated_data)
+            # If no output file specified, use the uploaded file
+            if not output_file and hasattr(self, 'uploaded_file_path'):
+                output_file = self.uploaded_file_path
+            elif not output_file:
+                output_file = "propstream_contacts.csv"
                 
-            logger.info(f"Data saved to {output_file} successfully! ({len(deduplicated_data)} contacts)")
-            return True
+            logger.info(f"Preparing to update file: {output_file}")
+            
+            # Get current timestamp
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Check if file is CSV
+            if output_file.lower().endswith('.csv'):
+                # Read the original CSV file
+                original_data = []
+                fieldnames = []
+                
+                try:
+                    with open(output_file, 'r', newline='', encoding='utf-8') as f:
+                        reader = csv.DictReader(f)
+                        fieldnames = reader.fieldnames or []
+                        original_data = list(reader)
+                        
+                    logger.info(f"Read {len(original_data)} rows from original file")
+                except Exception as e:
+                    logger.error(f"Error reading original CSV: {str(e)}")
+                    # If we can't read the file, we'll create a new one
+                    original_data = []
+                    fieldnames = ['First Name', 'Middle Name', 'Last Name']
+                
+                # Our new fields we want to add
+                new_fields = ['Phone', 'Mobile Phone', 'Landline', 'Email', 'Propstream Updated Date & Time']
+                
+                # First, check if any of our fields already exist
+                existing_fields = [field for field in new_fields if field in fieldnames]
+                
+                # If none of our fields exist yet, we need to add them in the right position
+                if not existing_fields:
+                    # Determine where to insert our new fields
+                    # Instead of trying to be clever, we'll directly analyze the Excel file structure
+                    # from the screenshot
+                    
+                    # Common last columns before our data should be added
+                    last_column_candidates = [
+                        'Recorded Date', 'Last Date',
+                        'Lender/Mortgage', 'Mortgage',
+                        'Date', 'Recorded', 'Last'
+                    ]
+                    
+                    # Find the last column that should appear before our new fields
+                    insert_after = None
+                    for candidate in last_column_candidates:
+                        if candidate in fieldnames:
+                            candidate_index = fieldnames.index(candidate)
+                            if insert_after is None or candidate_index > insert_after:
+                                insert_after = candidate_index
+                    
+                    # If we couldn't find a good insertion point, just use the last field
+                    if insert_after is None:
+                        insert_after = len(fieldnames) - 1
+                    
+                    # Create a new fieldnames list with our fields inserted at the right position
+                    new_fieldnames = []
+                    for i, field in enumerate(fieldnames):
+                        new_fieldnames.append(field)
+                        # Insert our new fields right after the chosen column
+                        if i == insert_after:
+                            new_fieldnames.extend(new_fields)
+                    
+                    # Use the new fieldnames
+                    fieldnames = new_fieldnames
+                
+                # Try to match scraped data with original data
+                # Look for any available property that might help with matching
+                # The first approach is to try matching by First Name + Last Name if available
+                matched_indices = set()
+                
+                # First, try to identify unique identifiers in the original data that we can use for matching
+                # We'll use Address or Zip or any other available data 
+                identifier_columns = [
+                    ('First Name', 'Last Name'),  # Try matching by first and last name
+                    ('Zip',),  # Try matching by zip alone
+                    ('Address',),  # Try matching by address
+                    ('Street Address',),  # Alternative name for address
+                    ('Property Address',),  # Another alternative
+                ]
+                
+                # For each scraped contact, try to find a match in the original data
+                for scraped_index, scraped_contact in enumerate(self.scraped_data):
+                    matched = False
+                    
+                    # Try different identifier combinations
+                    for identifier_set in identifier_columns:
+                        if matched:
+                            break
+                            
+                        # Check if we have this identifier in the original data
+                        if all(id_col in fieldnames for id_col in identifier_set):
+                            # If we have first/last name in our scraped data, try to match by that
+                            if identifier_set == ('First Name', 'Last Name'):
+                                # Only try name matching if we have name data
+                                if not scraped_contact.get('first_name', '') and not scraped_contact.get('last_name', ''):
+                                    continue
+                                    
+                                # Try matching by name
+                                for i, row in enumerate(original_data):
+                                    if i in matched_indices:
+                                        continue
+                                        
+                                    if (scraped_contact.get('first_name', '').strip().lower() == row.get('First Name', '').strip().lower() and 
+                                        scraped_contact.get('last_name', '').strip().lower() == row.get('Last Name', '').strip().lower() and
+                                        scraped_contact.get('first_name', '') and row.get('First Name', '')):  # Ensure not matching empty names
+                                        
+                                        # We found a match! Update this row with our data
+                                        matched = True
+                                        matched_indices.add(i)
+                                        
+                                        # Combine phone numbers, removing duplicates
+                                        all_phones = scraped_contact.get('phones', [])
+                                        all_mobile_phones = scraped_contact.get('mobile_phones', [])
+                                        all_landlines = scraped_contact.get('landlines', [])
+                                        
+                                        # Update the original row with our scraped data
+                                        original_data[i]['Phone'] = ', '.join(set(all_phones))
+                                        original_data[i]['Mobile Phone'] = ', '.join(set(all_mobile_phones))
+                                        original_data[i]['Landline'] = ', '.join(set(all_landlines))
+                                        original_data[i]['Email'] = scraped_contact.get('email', '')
+                                        original_data[i]['Propstream Updated Date & Time'] = timestamp
+                                        break
+                            # Try matching by other identifiers
+                            else:
+                                identifier_val = None
+                                # For simpler identifiers like Zip or Address
+                                if len(identifier_set) == 1:
+                                    identifier_col = identifier_set[0]
+                                    # Try to find this identifier in the scraped data based on likely field patterns
+                                    if identifier_col == 'Zip':
+                                        # Extract zip from any address field in scraped data
+                                        # This is just a simple heuristic - in reality would need more sophisticated matching
+                                        for field in ['address', 'full_address', 'property_address']:
+                                            address = scraped_contact.get(field, '')
+                                            if address:
+                                                zip_match = re.search(r'\b\d{5}(?:-\d{4})?\b', address)
+                                                if zip_match:
+                                                    identifier_val = zip_match.group(0)
+                                                    break
+                                    elif identifier_col in ['Address', 'Street Address', 'Property Address']:
+                                        # Use any address field in scraped data
+                                        for field in ['address', 'full_address', 'property_address']:
+                                            identifier_val = scraped_contact.get(field, '')
+                                            if identifier_val:
+                                                break
+                                                
+                                    # If we found a value to match on, try matching each row
+                                    if identifier_val:
+                                        for i, row in enumerate(original_data):
+                                            if i in matched_indices:
+                                                continue
+                                                
+                                            row_val = row.get(identifier_col, '')
+                                            # For addresses, do a partial match
+                                            if identifier_col in ['Address', 'Street Address', 'Property Address']:
+                                                if identifier_val.lower() in row_val.lower() or row_val.lower() in identifier_val.lower():
+                                                    matched = True
+                                                    matched_indices.add(i)
+                                                    
+                                                    # Update the original row with our scraped data
+                                                    all_phones = scraped_contact.get('phones', [])
+                                                    all_mobile_phones = scraped_contact.get('mobile_phones', [])
+                                                    all_landlines = scraped_contact.get('landlines', [])
+                                                    
+                                                    original_data[i]['Phone'] = ', '.join(set(all_phones))
+                                                    original_data[i]['Mobile Phone'] = ', '.join(set(all_mobile_phones))
+                                                    original_data[i]['Landline'] = ', '.join(set(all_landlines))
+                                                    original_data[i]['Email'] = scraped_contact.get('email', '')
+                                                    original_data[i]['Propstream Updated Date & Time'] = timestamp
+                                                    break
+                                            # For exact identifiers like zip, do exact match
+                                            elif row_val.strip() == identifier_val.strip():
+                                                matched = True
+                                                matched_indices.add(i)
+                                                
+                                                # Update the original row with our scraped data
+                                                all_phones = scraped_contact.get('phones', [])
+                                                all_mobile_phones = scraped_contact.get('mobile_phones', [])
+                                                all_landlines = scraped_contact.get('landlines', [])
+                                                
+                                                original_data[i]['Phone'] = ', '.join(set(all_phones))
+                                                original_data[i]['Mobile Phone'] = ', '.join(set(all_mobile_phones))
+                                                original_data[i]['Landline'] = ', '.join(set(all_landlines))
+                                                original_data[i]['Email'] = scraped_contact.get('email', '')
+                                                original_data[i]['Propstream Updated Date & Time'] = timestamp
+                                                break
+                
+                # If we have unmatched scraped data and unmatched original rows,
+                # assign the data sequentially based on order
+                unmatched_scraped = [sc for i, sc in enumerate(self.scraped_data) if i not in matched_indices]
+                unmatched_rows = [i for i in range(len(original_data)) if i not in matched_indices]
+                
+                # Match by position (this is a fallback if we couldn't match by identifiers)
+                for i in range(min(len(unmatched_scraped), len(unmatched_rows))):
+                    row_idx = unmatched_rows[i]
+                    scraped_contact = unmatched_scraped[i]
+                    
+                    # Combine phone numbers, removing duplicates
+                    all_phones = scraped_contact.get('phones', [])
+                    all_mobile_phones = scraped_contact.get('mobile_phones', [])
+                    all_landlines = scraped_contact.get('landlines', [])
+                    
+                    # Update the original row with our scraped data
+                    original_data[row_idx]['Phone'] = ', '.join(set(all_phones))
+                    original_data[row_idx]['Mobile Phone'] = ', '.join(set(all_mobile_phones))
+                    original_data[row_idx]['Landline'] = ', '.join(set(all_landlines))
+                    original_data[row_idx]['Email'] = scraped_contact.get('email', '')
+                    original_data[row_idx]['Propstream Updated Date & Time'] = timestamp
+                
+                # If we still have more scraped data than original rows, add new rows
+                remaining_scraped = unmatched_scraped[len(unmatched_rows):]
+                for scraped_contact in remaining_scraped:
+                    new_row = {}
+                    for field in fieldnames:
+                        new_row[field] = ''
+                    
+                    # Set name fields
+                    new_row['First Name'] = scraped_contact.get('first_name', '')
+                    new_row['Middle Name'] = scraped_contact.get('middle_name', '')
+                    new_row['Last Name'] = scraped_contact.get('last_name', '')
+                    
+                    # Set phone fields
+                    new_row['Phone'] = ', '.join(set(scraped_contact.get('phones', [])))
+                    new_row['Mobile Phone'] = ', '.join(set(scraped_contact.get('mobile_phones', [])))
+                    new_row['Landline'] = ', '.join(set(scraped_contact.get('landlines', [])))
+                    
+                    # Set email and timestamp
+                    new_row['Email'] = scraped_contact.get('email', '')
+                    new_row['Propstream Updated Date & Time'] = timestamp
+                    
+                    original_data.append(new_row)
+                
+                # Ensure all rows have the new fields
+                for row in original_data:
+                    for field in new_fields:
+                        if field not in row:
+                            row[field] = ''
+                
+                # Write the updated data back to the file
+                with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(original_data)
+                
+                logger.info(f"Data saved to {output_file} successfully! ({len(original_data)} contacts)")
+                return True
+            else:
+                logger.error(f"File {output_file} is not a CSV file. Only CSV files are supported for updates.")
+                return False
+                
         except Exception as e:
             logger.error(f"Failed to save data: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     def run(self):
