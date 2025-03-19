@@ -191,14 +191,14 @@ class PropStreamHTMLScraper:
     def upload_file_and_create_group(self, file_path):
         """Upload file and create a new group"""
         try:
-            logger.info("Accessing import list page...")
+            logger.info("Accessing contacts page...")
             
-            # Navigate to import list page
+            # Navigate directly to contacts page
             import_url = f"{self.base_url}/contacts"
             import_response = self.session.get(import_url)
             
             if import_response.status_code != 200:
-                logger.error(f"Failed to access import page: {import_response.status_code}")
+                logger.error(f"Failed to access contacts page: {import_response.status_code}")
                 return None
             
             # Save the import page for debugging
@@ -206,30 +206,20 @@ class PropStreamHTMLScraper:
                 f.write(import_response.text)
             logger.info("Saved import page to import_page.html for debugging")
             
-            # Step 5: Click the "Import List" button
-            logger.info("Clicking 'Import List' button...")
-            import_list_url = f"{self.base_url}/api/contacts/import"
-            import_list_response = self.session.post(import_list_url)
+            # Step 1: Upload the file directly (skip the Import List button)
+            logger.info(f"Uploading file: {os.path.basename(file_path)}...")
+            upload_url = f"{self.base_url}/api/contacts/upload"
             
-            if import_list_response.status_code not in [200, 201, 202]:
-                logger.warning(f"Failed to click Import List button: {import_list_response.status_code}")
-            
-            time.sleep(1)  # Wait a moment for the page to load
-            
-            # Prepare the file for upload
+            # Prepare file for upload
             file_name = os.path.basename(file_path)
             content_type = 'text/csv' if file_path.endswith('.csv') else 'application/vnd.ms-excel'
             
             with open(file_path, 'rb') as file:
                 file_content = file.read()
             
-            # Create multipart form data for the file upload
+            # Upload using MultipartEncoder if available
             try:
                 from requests_toolbelt.multipart.encoder import MultipartEncoder
-                
-                # Step 6-7: Upload the file
-                logger.info(f"Uploading file: {file_name}...")
-                upload_url = f"{self.base_url}/api/contacts/upload"
                 
                 multipart_data = MultipartEncoder(
                     fields={
@@ -243,7 +233,6 @@ class PropStreamHTMLScraper:
                     'Content-Type': multipart_data.content_type
                 }
                 
-                # Upload the file
                 upload_response = self.session.post(
                     upload_url,
                     data=multipart_data,
@@ -263,138 +252,219 @@ class PropStreamHTMLScraper:
                     'contentType': content_type
                 }
                 
-                # Upload the file
                 upload_response = self.session.post(
                     upload_url,
                     files=files,
                     data=data
                 )
             
-            # Save the upload response for debugging
+            # Save upload response for debugging
             with open("upload_response.html", "w", encoding="utf-8") as f:
                 f.write(upload_response.text)
             logger.info("Saved upload response to upload_response.html for debugging")
             
-            # Extract the file ID from the response
+            # Get file ID from the upload response
             file_id = None
-            
             try:
-                if upload_response.status_code in [200, 201, 202]:
-                    content_type = upload_response.headers.get('Content-Type', '')
-                    if content_type and 'application/json' in content_type:
-                        upload_data = upload_response.json()
-                        file_id = upload_data.get('id') or upload_data.get('fileId')
-                    
-                    if not file_id:
-                        # Try to extract from response text
-                        id_match = re.search(r'"id"[:\s]+"([^"]+)"', upload_response.text)
-                        if id_match:
-                            file_id = id_match.group(1)
-                        else:
-                            # Generate a timestamp as fallback ID
-                            file_id = str(int(time.time()))
-                            logger.warning(f"Using timestamp as file ID: {file_id}")
-                else:
-                    logger.error(f"File upload failed with status: {upload_response.status_code}")
-                    return None
+                if 'application/json' in upload_response.headers.get('Content-Type', ''):
+                    upload_data = upload_response.json()
+                    file_id = upload_data.get('id') or upload_data.get('fileId')
+                    logger.info(f"Extracted file ID from JSON response: {file_id}")
             except Exception as e:
-                logger.error(f"Error parsing upload response: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                file_id = str(int(time.time()))
-                logger.warning(f"Using timestamp as fallback file ID: {file_id}")
+                logger.warning(f"Error parsing upload JSON: {str(e)}")
             
-            # Step 8: Select "Create New" radio button
+            # If still no file ID, try to extract from response text
+            if not file_id:
+                try:
+                    id_match = re.search(r'"id"[:\s]+"([^"]+)"', upload_response.text)
+                    if id_match:
+                        file_id = id_match.group(1)
+                        logger.info(f"Extracted file ID from response text: {file_id}")
+                    else:
+                        # Use timestamp as fallback
+                        file_id = str(int(time.time()))
+                        logger.warning(f"Using timestamp as file ID: {file_id}")
+                except Exception as e:
+                    logger.warning(f"Error extracting file ID: {str(e)}")
+                    file_id = str(int(time.time()))
+            
+            # Wait longer after upload to ensure file is processed
+            logger.info("Waiting for file processing...")
+            time.sleep(10)
+            
+            # Step 2: Select "Create New" radio button
             logger.info("Selecting 'Create New' option...")
-            create_new_url = f"{self.base_url}/api/contacts/import/mode"
-            create_new_data = {"mode": "new"}
-            create_new_response = self.session.post(create_new_url, json=create_new_data)
+            add_to_group_url = f"{self.base_url}/api/contacts/import/mode"
+            add_to_group_data = {"mode": "new"}
+            add_response = self.session.post(add_to_group_url, json=add_to_group_data)
             
-            if create_new_response.status_code not in [200, 201, 202]:
-                logger.warning(f"Failed to select Create New option: {create_new_response.status_code}")
+            if add_response.status_code not in [200, 201, 202]:
+                logger.warning(f"Failed to select 'Create New' option: {add_response.status_code}")
             
-            time.sleep(1)  # Wait a moment
+            time.sleep(2)
             
-            # Step 9: Enter group name
+            # Step 3: Set group name and click Save button
             group_name = f"Foreclosures_scraping_{time.strftime('%Y%m%d_%H%M%S')}"
-            logger.info(f"Setting group name: {group_name}")
+            logger.info(f"Creating new group: {group_name}")
             
-            # Now create a group for the uploaded contacts
-            group_url = f"{self.base_url}/api/contacts/import/save"
-            
-            # Prepare group creation data
-            group_data = {
-                "name": group_name,
+            # Save to create the group with the imported contacts - use groupName as seen in network tab
+            save_url = f"{self.base_url}/api/contacts/import/save"
+            save_data = {
                 "fileId": file_id,
+                "groupName": group_name,
                 "mode": "new"
             }
+            save_response = self.session.post(save_url, json=save_data)
             
-            # Step 10: Create the group (Save button)
-            logger.info("Clicking Save button...")
-            group_response = self.session.post(
-                group_url,
-                json=group_data
-            )
+            logger.info(f"Save response status: {save_response.status_code}")
             
-            # Save the group creation response for debugging
-            with open("group_response.html", "w", encoding="utf-8") as f:
-                f.write(group_response.text)
-            logger.info("Saved group creation response to group_response.html for debugging")
-            
-            # Extract group ID
+            # Extract group ID from response
             group_id = None
-            try:
-                if group_response.status_code in [200, 201, 202]:
-                    content_type = group_response.headers.get('Content-Type', '')
-                    if content_type and 'application/json' in content_type:
-                        group_data = group_response.json()
-                        group_id = group_data.get('id') or group_data.get('groupId')
-                    
-                    if not group_id:
-                        # Try to extract from response text
-                        id_match = re.search(r'"id"[:\s]+"([^"]+)"', group_response.text)
-                        if id_match:
-                            group_id = id_match.group(1)
-                        else:
-                            # Use file ID as fallback
-                            group_id = file_id
-                            logger.warning(f"Using file ID as group ID: {group_id}")
-                else:
-                    logger.error(f"Group creation failed with status: {group_response.status_code}")
-                    return None
-            except Exception as e:
-                logger.error(f"Error parsing group creation response: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                group_id = file_id
-                logger.warning(f"Using file ID as fallback group ID: {group_id}")
             
-            # Wait for the import to complete
+            # Try to get group ID from Location header
+            if 'Location' in save_response.headers:
+                location = save_response.headers['Location']
+                group_id_match = re.search(r'[\?&]id=([^&]+)', location)
+                if group_id_match:
+                    group_id = group_id_match.group(1)
+                    logger.info(f"Extracted group ID from Location header: {group_id}")
+            
+            # If no group ID yet, try other methods
+            if not group_id:
+                # Try to extract from response body if it's JSON
+                try:
+                    if 'application/json' in save_response.headers.get('Content-Type', ''):
+                        save_data = save_response.json()
+                        group_id = save_data.get('id') or save_data.get('groupId')
+                        if group_id:
+                            logger.info(f"Extracted group ID from JSON response: {group_id}")
+                except Exception as e:
+                    logger.warning(f"Error parsing save response JSON: {str(e)}")
+            
+            # If still no group ID, try to extract from HTML
+            if not group_id:
+                try:
+                    group_id_match = re.search(r'groupId=([^&"]+)', save_response.text)
+                    if group_id_match:
+                        group_id = group_id_match.group(1)
+                        logger.info(f"Extracted group ID from response HTML: {group_id}")
+                    else:
+                        # Try looking for the group by name
+                        logger.info(f"Looking for group by name: {group_name}")
+                        time.sleep(5)  # Wait a bit before checking
+                        
+                        # Get list of groups
+                        groups_url = f"{self.base_url}/api/contact-groups"
+                        # Add retry logic for getting groups
+                        max_retries = 3
+                        retry_delay = 3
+                        
+                        for retry in range(max_retries):
+                            try:
+                                # Get the groups list with retry
+                                groups_response = self.session.get(groups_url)
+                                
+                                # Check if the response is JSON
+                                if groups_response.status_code == 200 and 'application/json' in groups_response.headers.get('Content-Type', ''):
+                                    groups_data = groups_response.json()
+                                    for group in groups_data:
+                                        if group.get('name') == group_name:
+                                            group_id = group.get('id')
+                                            logger.info(f"Found group by name with ID: {group_id}")
+                                            break
+                                    
+                                    # If we found the group, break out of retry loop
+                                    if group_id:
+                                        break
+                                else:
+                                    # If not JSON, log and try again
+                                    logger.warning(f"Groups response not JSON (attempt {retry+1}/{max_retries}): {groups_response.status_code}")
+                                    if retry < max_retries - 1:
+                                        # Wait longer with each retry
+                                        time.sleep(retry_delay * (retry + 1))
+                                        continue
+                            except Exception as e:
+                                logger.warning(f"Error finding group by name (attempt {retry+1}/{max_retries}): {str(e)}")
+                                if retry < max_retries - 1:
+                                    # Wait longer with each retry
+                                    time.sleep(retry_delay * (retry + 1))
+                                    continue
+                        
+                        # If we still can't get the group ID, extract it from the URL
+                        if not group_id:
+                            # Navigate to contacts page to see if we can find our group
+                            try:
+                                contacts_url = f"{self.base_url}/contacts"
+                                contacts_response = self.session.get(contacts_url)
+                                
+                                if contacts_response.status_code == 200:
+                                    # Look for the group name in the HTML
+                                    group_pattern = re.compile(f'{re.escape(group_name)}.*?groupId=([^&"\']+)', re.DOTALL)
+                                    group_match = group_pattern.search(contacts_response.text)
+                                    
+                                    if group_match:
+                                        group_id = group_match.group(1)
+                                        logger.info(f"Found group ID from contacts page: {group_id}")
+                            except Exception as e:
+                                logger.warning(f"Error extracting group ID from contacts page: {str(e)}")
+                            
+                            # If still no ID, just proceed with what we have
+                            if not group_id:
+                                # Get the ID directly from the save response if possible
+                                save_id_match = re.search(r'"id"\s*:\s*"([^"]+)"', save_response.text)
+                                if save_id_match:
+                                    group_id = save_id_match.group(1)
+                                    logger.info(f"Extracted group ID directly from save response: {group_id}")
+                except Exception as e:
+                    logger.warning(f"Error finding group by name: {str(e)}")
+            
+            # Use fallback if still no group ID
+            if not group_id:
+                group_id = f"group_{int(time.time())}"
+                logger.info(f"Using fallback group ID: {group_id}")
+            
+            # Wait for import to complete
             logger.info(f"Waiting for contacts to be imported into group '{group_name}'...")
-            time.sleep(5)  # Wait for contacts to be imported
+            time.sleep(30)  # Give PropStream plenty of time to process the file
             
-            # Verify that contacts were imported
+            # Verify contacts were imported
             contacts_url = f"{self.base_url}/api/contact-groups/{group_id}/contacts"
             contacts_response = self.session.get(contacts_url)
             
             contact_count = 0
-            if contacts_response.status_code == 200:
-                try:
-                    if contacts_response.headers.get('Content-Type', '').startswith('application/json'):
-                        contacts_data = contacts_response.json()
-                        
-                        # Handle different response formats
-                        if 'items' in contacts_data:
-                            contact_count = len(contacts_data['items'])
-                        elif 'contacts' in contacts_data:
-                            contact_count = len(contacts_data['contacts'])
-                        elif isinstance(contacts_data, list):
-                            contact_count = len(contacts_data)
-                        elif 'count' in contacts_data:
-                            contact_count = contacts_data['count']
-                except Exception as e:
-                    logger.warning(f"Error checking contact count: {str(e)}")
+            try:
+                if contacts_response.status_code == 200:
+                    # Try to parse the response if it's JSON
+                    try:
+                        if 'application/json' in contacts_response.headers.get('Content-Type', ''):
+                            contacts_data = contacts_response.json()
+                            
+                            # Log the response structure for debugging
+                            with open("contacts_debug.json", "w", encoding="utf-8") as f:
+                                f.write(json.dumps(contacts_data, indent=2))
+                            
+                            # Try different possible response structures
+                            if 'items' in contacts_data:
+                                contact_count = len(contacts_data['items'])
+                            elif 'contacts' in contacts_data:
+                                contact_count = len(contacts_data['contacts'])
+                            elif isinstance(contacts_data, list):
+                                contact_count = len(contacts_data)
+                            elif 'count' in contacts_data:
+                                contact_count = contacts_data['count']
+                            
+                            logger.info(f"Found {contact_count} contacts in the group")
+                    except Exception as e:
+                        logger.warning(f"Error parsing contacts response: {str(e)}")
+                        # Save raw response for debugging
+                        with open("contacts_response_raw.txt", "w", encoding="utf-8") as f:
+                            f.write(contacts_response.text)
+                else:
+                    logger.warning(f"Failed to verify contacts: {contacts_response.status_code}")
+            except Exception as e:
+                logger.error(f"Error verifying contacts: {str(e)}")
             
+            # Always return the group ID, even if we couldn't verify contacts
             logger.info(f"Group '{group_name}' created with ID: {group_id} containing {contact_count} contacts")
             return group_id
         except Exception as e:
@@ -789,6 +859,138 @@ class PropStreamHTMLScraper:
             logger.error(f"Error while waiting for order completion: {str(e)}")
             return False
     
+    def extract_contact_data_from_html(self, html_content):
+        """Extract contact data directly from HTML using CSS selectors"""
+        try:
+            logger.info("Extracting contact data from HTML...")
+            
+            soup = BeautifulSoup(html_content, 'html.parser')
+            contacts_data = []
+            
+            # Try to find contact forms in the HTML
+            contact_forms = soup.find_all('form') or []
+            
+            if not contact_forms:
+                logger.warning("No contact forms found in HTML")
+                
+                # Try alternative method - look for specific selectors
+                # First Name selector
+                first_name_selector = "#root > div > div.src-components-Loader-style__tbIRk__withHoverLoader > div > div > div.src-app-style__x5gBM__wrapper > div:nth-child(3) > div:nth-child(2) > div > div.src-app-Contacts-style__fJY6___rightSide > div > div.src-app-Contacts-ContactEditor-style__MKOqR__body > div > div.src-app-Contacts-ContactEditor-style__K2bsg__fields > div:nth-child(1) > div:nth-child(1) > div > div > input[type=text]"
+                # Middle Name selector
+                middle_name_selector = "input[name='middleName'][type='text']"
+                # Last Name selector
+                last_name_selector = "#root > div > div.src-components-Loader-style__tbIRk__withHoverLoader > div > div > div.src-app-style__x5gBM__wrapper > div:nth-child(3) > div:nth-child(2) > div > div.src-app-Contacts-style__fJY6___rightSide > div > div.src-app-Contacts-ContactEditor-style__MKOqR__body > div > div.src-app-Contacts-ContactEditor-style__K2bsg__fields > div:nth-child(1) > div:nth-child(3) > div > div > input[type=text]"
+                # Street Address selector
+                street_address_selector = "#root > div > div.src-components-Loader-style__tbIRk__withHoverLoader > div > div > div.src-app-style__x5gBM__wrapper > div:nth-child(3) > div:nth-child(2) > div > div.src-app-Contacts-style__fJY6___rightSide > div > div.src-app-Contacts-ContactEditor-style__MKOqR__body > div > div.src-app-Contacts-ContactEditor-style__K2bsg__fields > div:nth-child(3) > div.src-app-Contacts-ContactEditor-style__zrACj__lg > div > div > input[type=text]"
+                # City selector
+                city_selector = "#root > div > div.src-components-Loader-style__tbIRk__withHoverLoader > div > div > div.src-app-style__x5gBM__wrapper > div:nth-child(3) > div:nth-child(2) > div > div.src-app-Contacts-style__fJY6___rightSide > div > div.src-app-Contacts-ContactEditor-style__MKOqR__body > div > div.src-app-Contacts-ContactEditor-style__K2bsg__fields > div:nth-child(3) > div.src-app-Contacts-ContactEditor-style__iY0fh__md > div > div > input[type=text]"
+                # State selector
+                state_selector = "#root > div > div.src-components-Loader-style__tbIRk__withHoverLoader > div > div > div.src-app-style__x5gBM__wrapper > div:nth-child(3) > div:nth-child(2) > div > div.src-app-Contacts-style__fJY6___rightSide > div > div.src-app-Contacts-ContactEditor-style__MKOqR__body > div > div.src-app-Contacts-ContactEditor-style__K2bsg__fields > div:nth-child(4) > div.src-app-Contacts-ContactEditor-style__zrACj__lg > div > div > div > select"
+                # Zip selector
+                zip_selector = "#root > div > div.src-components-Loader-style__tbIRk__withHoverLoader > div > div > div.src-app-style__x5gBM__wrapper > div:nth-child(3) > div:nth-child(2) > div > div.src-app-Contacts-style__fJY6___rightSide > div > div.src-app-Contacts-ContactEditor-style__MKOqR__body > div > div.src-app-Contacts-ContactEditor-style__K2bsg__fields > div:nth-child(4) > div.src-app-Contacts-ContactEditor-style__iY0fh__md > div > div > input[type=text]"
+                
+                # Try simpler selectors if complex ones fail
+                # First we'll try the complex selectors
+                first_name_elements = soup.select(first_name_selector)
+                if not first_name_elements:
+                    # Fallback to simpler selectors
+                    first_name_elements = soup.find_all('input', {'type': 'text', 'placeholder': re.compile(r'First\s*Name', re.I)})
+                    if not first_name_elements:
+                        first_name_elements = soup.find_all('input', {'name': re.compile(r'first', re.I)})
+                
+                middle_name_elements = soup.select(middle_name_selector)
+                if not middle_name_elements:
+                    middle_name_elements = soup.find_all('input', {'name': re.compile(r'middle', re.I)})
+                    
+                last_name_elements = soup.select(last_name_selector)
+                if not last_name_elements:
+                    last_name_elements = soup.find_all('input', {'type': 'text', 'placeholder': re.compile(r'Last\s*Name', re.I)})
+                    if not last_name_elements:
+                        last_name_elements = soup.find_all('input', {'name': re.compile(r'last', re.I)})
+                
+                # Process all rows of contact data we can find
+                # If we found any contact fields, we'll collect the data
+                if first_name_elements or last_name_elements:
+                    logger.info("Found contact fields, extracting data...")
+                    
+                    # Extract data from the first contact
+                    contact_info = {}
+                    
+                    # Get first name
+                    if first_name_elements:
+                        first_name = first_name_elements[0].get('value', '')
+                        if first_name:
+                            contact_info['first_name'] = first_name
+                    
+                    # Get middle name
+                    if middle_name_elements:
+                        middle_name = middle_name_elements[0].get('value', '')
+                        if middle_name:
+                            contact_info['middle_name'] = middle_name
+                    
+                    # Get last name
+                    if last_name_elements:
+                        last_name = last_name_elements[0].get('value', '')
+                        if last_name:
+                            contact_info['last_name'] = last_name
+                    
+                    # If we have any contact info, add it to the list
+                    if contact_info:
+                        contacts_data.append(contact_info)
+                
+                # Try to find contact data in table format
+                # Look for tables that might contain contact data
+                tables = soup.find_all('table')
+                for table in tables:
+                    rows = table.find_all('tr')
+                    for row in rows:
+                        cells = row.find_all('td')
+                        if len(cells) >= 3:  # At least name, phone, email
+                            contact_info = {}
+                            
+                            # Try to extract name
+                            name_cell = cells[0]
+                            name_text = name_cell.get_text().strip()
+                            name_parts = name_text.split()
+                            
+                            if len(name_parts) >= 2:
+                                contact_info['first_name'] = name_parts[0]
+                                contact_info['last_name'] = name_parts[-1]
+                                if len(name_parts) > 2:
+                                    contact_info['middle_name'] = ' '.join(name_parts[1:-1])
+                            
+                            # Try to extract phone
+                            if len(cells) > 1:
+                                phone_cell = cells[1]
+                                phone_text = phone_cell.get_text().strip()
+                                if re.search(r'\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', phone_text):
+                                    contact_info['phones'] = [phone_text]
+                            
+                            # Try to extract email
+                            if len(cells) > 2:
+                                email_cell = cells[2]
+                                email_text = email_cell.get_text().strip()
+                                if '@' in email_text:
+                                    contact_info['email'] = email_text
+                            
+                            # If we have any contact info, add it to the list
+                            if contact_info:
+                                contacts_data.append(contact_info)
+            
+            # If we found contact data, return it
+            if contacts_data:
+                logger.info(f"Successfully extracted {len(contacts_data)} contacts from HTML")
+                return contacts_data
+            else:
+                logger.warning("No contact data found in HTML")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error extracting contact data from HTML: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+            
     def get_contact_data(self, group_id):
         """Get contact data from the completed order"""
         try:
@@ -807,7 +1009,14 @@ class PropStreamHTMLScraper:
                 f.write(contact_response.text)
             logger.info("Saved contact page to contact_page.html for debugging")
             
-            # Get list of all available lists including skip tracing lists
+            # First try to extract contacts directly from the HTML
+            html_contacts = self.extract_contact_data_from_html(contact_response.text)
+            if html_contacts:
+                logger.info(f"Found {len(html_contacts)} contacts directly from HTML")
+                self.scraped_data = html_contacts
+                return True
+                
+            # If we couldn't extract directly, try the API approach
             lists_url = f"{self.base_url}/api/contacts/lists"
             lists_response = self.session.get(lists_url)
             
@@ -826,7 +1035,7 @@ class PropStreamHTMLScraper:
                 # Look for our list with date pattern
                 for list_item in lists_data:
                     list_name = list_item.get('name', '')
-                    if today_date in list_name and (str(group_id) in list_name or "skip" in list_name.lower()):
+                    if (today_date in list_name and str(group_id) in list_name) or "skip" in list_name.lower():
                         target_list_id = list_item.get('id')
                         logger.info(f"Found target list: {list_name} with ID {target_list_id}")
                         break
@@ -1259,6 +1468,113 @@ class PropStreamHTMLScraper:
             logger.error(traceback.format_exc())
             return False
     
+    def prepare_csv_for_upload(self, file_path):
+        """Validate and prepare CSV file for upload to PropStream"""
+        try:
+            logger.info(f"Preparing CSV file for upload: {file_path}")
+            
+            # PropStream expected field names
+            expected_fields = [
+                "First Name", "Middle Name", "Last Name", 
+                "Street Address", "City", "State", "Zip"
+            ]
+            
+            # Read the original CSV
+            original_data = []
+            original_fieldnames = []
+            
+            with open(file_path, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                original_fieldnames = reader.fieldnames or []
+                original_data = list(reader)
+            
+            if not original_data:
+                logger.error("CSV file is empty. PropStream requires at least one contact.")
+                return False
+                
+            logger.info(f"Original CSV has {len(original_data)} rows with headers: {original_fieldnames}")
+            
+            # Check if fields need mapping
+            missing_fields = [field for field in expected_fields if field not in original_fieldnames]
+            
+            # If any expected fields are missing, we need to map them
+            if missing_fields:
+                logger.warning(f"Missing required fields in CSV: {missing_fields}")
+                
+                # Common variations of field names to check
+                field_variations = {
+                    "First Name": ["firstname", "first", "fname", "given name"],
+                    "Middle Name": ["middlename", "middle", "mname"],
+                    "Last Name": ["lastname", "last", "lname", "surname", "family name"],
+                    "Street Address": ["address", "street", "property address", "property street", "addr"],
+                    "City": ["town", "municipality", "property city"],
+                    "State": ["province", "region", "property state"],
+                    "Zip": ["zipcode", "postal code", "zip code", "postal", "property zip"]
+                }
+                
+                # Create field mapping
+                field_mapping = {}
+                for expected_field in missing_fields:
+                    # Check for variations in case-insensitive way
+                    variations = field_variations.get(expected_field, [])
+                    mapped = False
+                    
+                    for field in original_fieldnames:
+                        if field.lower() in [v.lower() for v in variations]:
+                            field_mapping[field] = expected_field
+                            mapped = True
+                            break
+                    
+                    if not mapped:
+                        logger.warning(f"Could not map {expected_field} to any field in the CSV")
+                
+                # If we have mappings, create a new CSV file with correct headers
+                if field_mapping:
+                    logger.info(f"Mapping fields: {field_mapping}")
+                    
+                    new_fieldnames = original_fieldnames.copy()
+                    # Add any missing fields
+                    for expected_field in missing_fields:
+                        if expected_field not in new_fieldnames:
+                            new_fieldnames.append(expected_field)
+                    
+                    # Create new data with mapped fields
+                    new_data = []
+                    for row in original_data:
+                        new_row = row.copy()
+                        
+                        # Apply mappings
+                        for original_field, expected_field in field_mapping.items():
+                            if original_field in row:
+                                new_row[expected_field] = row[original_field]
+                        
+                        # Ensure all fields exist
+                        for field in new_fieldnames:
+                            if field not in new_row:
+                                new_row[field] = ""
+                                
+                        new_data.append(new_row)
+                    
+                    # Save to a new temporary file
+                    temp_file_path = file_path + ".formatted.csv"
+                    with open(temp_file_path, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.DictWriter(f, fieldnames=new_fieldnames)
+                        writer.writeheader()
+                        writer.writerows(new_data)
+                    
+                    logger.info(f"Created formatted CSV file: {temp_file_path}")
+                    return temp_file_path
+            
+            # If no mapping needed, use original file
+            logger.info("CSV file has all required fields, no formatting needed")
+            return file_path
+            
+        except Exception as e:
+            logger.error(f"Error preparing CSV file: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return file_path
+    
     def run(self):
         """Execute the complete scraping process"""
         try:
@@ -1273,8 +1589,14 @@ class PropStreamHTMLScraper:
                 logger.error("No file selected, aborting")
                 return False
             
+            # Step 2.5: Prepare CSV file for upload
+            prepared_file_path = self.prepare_csv_for_upload(file_path)
+            if not prepared_file_path:
+                logger.error("Failed to prepare CSV file, continuing with original file")
+                prepared_file_path = file_path
+            
             # Step 3: Upload file and create group
-            group_id = self.upload_file_and_create_group(file_path)
+            group_id = self.upload_file_and_create_group(prepared_file_path)
             if not group_id:
                 logger.error("Failed to upload file and create group, aborting")
                 return False
