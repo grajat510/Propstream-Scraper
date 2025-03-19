@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from tkinter import Tk, filedialog, messagebox
 from urllib.parse import urljoin, urlparse, parse_qs
 from dotenv import load_dotenv
+import pandas as pd
 
 # Load environment variables from .env file
 load_dotenv()
@@ -322,12 +323,28 @@ class PropStreamHTMLScraper:
                 'file': (os.path.basename(file_path), file_content, 'text/csv')
             }
             
-            upload_response = self.session.post(upload_url, files=files)
+            # Add specific headers that PropStream might expect
+            headers = {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+            
+            upload_response = self.session.post(upload_url, files=files, headers=headers)
             
             if upload_response.status_code not in [200, 201, 202]:
                 logger.error(f"Failed to upload file: {upload_response.status_code}")
                 logger.error(f"Response: {upload_response.text}")
-                return None
+                
+                # Try alternative upload endpoint
+                alt_upload_url = f"{self.base_url}/api/contacts/import/file"
+                logger.info(f"Trying alternative upload endpoint: {alt_upload_url}")
+                alt_upload_response = self.session.post(alt_upload_url, files=files, headers=headers)
+                
+                if alt_upload_response.status_code not in [200, 201, 202]:
+                    logger.error(f"Alternative upload also failed: {alt_upload_response.status_code}")
+                    return None
+                else:
+                    upload_response = alt_upload_response
             
             # Save response for debugging
             with open("upload_response.html", "w", encoding="utf-8") as f:
@@ -364,9 +381,41 @@ class PropStreamHTMLScraper:
             logger.info(f"FILE ID: {file_id} - This is the internal identifier for this uploaded file")
             logger.info("=" * 80)
             
-            # Wait longer after upload to ensure file is processed
+            # Wait for file processing with status checks
             logger.info("Waiting for file processing...")
-            time.sleep(10)
+            max_processing_wait = 5  # Maximum number of processing check attempts
+            
+            for attempt in range(max_processing_wait):
+                logger.info(f"Processing check attempt {attempt+1}/{max_processing_wait}")
+                
+                # Check processing status
+                status_urls = [
+                    f"{self.base_url}/api/contacts/import/status/{file_id}",
+                    f"{self.base_url}/api/contacts/import/{file_id}/status"
+                ]
+                
+                status_found = False
+                for status_url in status_urls:
+                    try:
+                        status_response = self.session.get(status_url)
+                        if status_response.status_code == 200:
+                            status_data = status_response.json()
+                            logger.info(f"Import status: {status_data}")
+                            
+                            # Check if processing is complete
+                            status = status_data.get('status')
+                            if status and status.lower() in ['complete', 'completed', 'done', 'finished']:
+                                logger.info("File processing complete!")
+                                status_found = True
+                                break
+                    except Exception as e:
+                        logger.warning(f"Error checking status: {str(e)}")
+                
+                if status_found:
+                    break
+                
+                # Wait between status checks
+                time.sleep(10)
             
             # Find the existing group 'Foreclosures_scraping_Test'
             logger.info("Finding existing group 'Foreclosures_scraping_Test'...")
@@ -490,6 +539,25 @@ class PropStreamHTMLScraper:
                 "mode": "existing"
             })
             
+            # Format 4: Using numeric ID if it's a dropdown ID
+            if is_dropdown_id:
+                numeric_id = group_id[1:] if group_id.startswith('C') else group_id
+                save_formats.append({
+                    "fileId": file_id,
+                    "groupId": numeric_id,
+                    "mode": "existing"
+                })
+            
+            # Format 5: Using both name and groupId with numeric ID
+            if is_dropdown_id:
+                numeric_id = group_id[1:] if group_id.startswith('C') else group_id
+                save_formats.append({
+                    "fileId": file_id,
+                    "name": group_id,
+                    "groupId": numeric_id,
+                    "mode": "add"
+                })
+            
             # Try each format until one works
             save_response = None
             successful_format = None
@@ -514,62 +582,62 @@ class PropStreamHTMLScraper:
             if not save_response or save_response.status_code not in [200, 201, 202]:
                 # Try the direct approach seen in the screenshots - full form data
                 form_data = {
+                    "fileId": file_id,
                     "mode": "add",
                     "name": group_id
                 }
                 
-                headers = {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": f"{self.base_url}/contacts",
-                    "Origin": self.base_url
-                }
+                direct_response = self.session.post(save_url, data=form_data)
+                logger.info(f"Direct form save response: {direct_response.status_code}")
                 
-                # Try to encode as form data
-                form_encoded = "&".join([f"{k}={v}" for k, v in form_data.items()])
-                form_response = self.session.post(save_url, data=form_encoded, headers=headers)
-                logger.info(f"Form encoded response: {form_response.status_code}")
+                # Save the direct response for debugging
+                with open("direct_save_response.html", "w", encoding="utf-8") as f:
+                    f.write(direct_response.text)
                 
-                with open("form_response.html", "w", encoding="utf-8") as f:
-                    f.write(form_response.text)
-                
-                # If this worked, use this response
-                if form_response.status_code in [200, 201, 202]:
-                    save_response = form_response
+                if direct_response.status_code in [200, 201, 202]:
+                    save_response = direct_response
                     successful_format = form_data
-                    logger.info("Form submission successful")
+                    logger.info("Successfully saved with direct form data approach")
+                else:
+                    logger.warning("All save approaches failed")
             
-            # Log final result
-            if save_response and save_response.status_code in [200, 201, 202]:
-                logger.info(f"Successfully saved with format: {successful_format}")
-            else:
-                logger.warning("All save formats failed, using last response")
-                save_response = current_response if 'current_response' in locals() else None
+            # Log the final save response status
+            if save_response:
+                logger.info(f"Final save response status: {save_response.status_code}")
+                
+                # Try to log response data if it's JSON
+                try:
+                    if 'application/json' in save_response.headers.get('Content-Type', ''):
+                        save_data = save_response.json()
+                        logger.info(f"Save response data: {save_data}")
+                except Exception as e:
+                    logger.warning(f"Error parsing save response as JSON: {str(e)}")
             
-            # Log final save response status
-            logger.info(f"Final save response status: {save_response.status_code if save_response else 'No response'}")
-            
-            # Check if we need to close a confirmation dialog
+            # Step 4: Handle confirmation dialogs that might appear after import
             try:
-                # Try to find and click "Close" button if we get a confirmation dialog
+                # Send confirmation close request
                 close_url = f"{self.base_url}/api/contacts/import/close"
                 close_response = self.session.post(close_url)
-                logger.info(f"Close confirmation dialog response: {close_response.status_code}")
+                logger.info(f"Close confirmation response: {close_response.status_code}")
                 
-                # Try "Done" button as well
+                # Send done confirmation
                 done_url = f"{self.base_url}/api/contacts/import/done"
                 done_response = self.session.post(done_url)
-                logger.info(f"Done button response: {done_response.status_code}")
+                logger.info(f"Done confirmation response: {done_response.status_code}")
             except Exception as e:
-                logger.warning(f"Error handling confirmation dialog: {str(e)}")
+                logger.warning(f"Error handling confirmation dialogs: {str(e)}")
             
-            # Wait for import to complete
-            logger.info(f"Waiting for contacts to be imported into existing group '{group_name}'...")
-            time.sleep(30)  # Give PropStream plenty of time to process the file
+            # Wait a bit longer to ensure contacts are processed and added to the group
+            logger.info("Waiting for contacts to be processed and added to the group...")
+            time.sleep(30)
             
-            # Try multiple URL formats to verify contacts were imported
+            # Get contacts for verification
+            logger.info(f"Verifying contacts were added to group: {group_id}")
+            
+            # Create a list of possible URLs to try for getting contacts
             contact_urls = []
             
-            # Format 1: Standard contact-groups endpoint with original ID
+            # Format 1: Standard contact-groups endpoint
             contact_urls.append(f"{self.base_url}/api/contact-groups/{group_id}/contacts")
             
             # Format 2: If dropdown ID, try with numeric part
@@ -585,14 +653,24 @@ class PropStreamHTMLScraper:
                 numeric_id = group_id[1:] if group_id[0] == 'C' else group_id
                 contact_urls.append(f"{self.base_url}/api/contacts/groups/{numeric_id}/contacts")
                 
+            # Format 5: Direct format from screenshot 
+            contact_urls.append(f"{self.base_url}/api/contacts?groupId={group_id}&page=1&pageSize=100")
+            
             # Try each URL format until one works
             contacts_response = None
             successful_url = None
             
             for i, url in enumerate(contact_urls):
                 logger.info(f"Trying contacts URL format {i+1}: {url}")
-                current_response = self.session.get(url)
+                
+                # Force browser cache refresh with timestamp
+                url_with_timestamp = f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
+                current_response = self.session.get(url_with_timestamp)
                 logger.info(f"Contacts URL format {i+1} response: {current_response.status_code}")
+                
+                # Save each response for debugging
+                with open(f"contacts_response_{i+1}.html", "w", encoding="utf-8") as f:
+                    f.write(current_response.text)
                 
                 # If successful, use this response and URL
                 if current_response.status_code == 200:
@@ -623,10 +701,19 @@ class PropStreamHTMLScraper:
                             # Try different possible response structures
                             if 'items' in contacts_data:
                                 contact_count = len(contacts_data['items'])
+                                # Log each contact for debugging
+                                for i, contact in enumerate(contacts_data['items']):
+                                    logger.info(f"Contact {i+1}: {contact.get('name', 'Unknown')}")
                             elif 'contacts' in contacts_data:
                                 contact_count = len(contacts_data['contacts'])
+                                # Log each contact for debugging
+                                for i, contact in enumerate(contacts_data['contacts']):
+                                    logger.info(f"Contact {i+1}: {contact.get('name', 'Unknown')}")
                             elif isinstance(contacts_data, list):
                                 contact_count = len(contacts_data)
+                                # Log each contact for debugging
+                                for i, contact in enumerate(contacts_data):
+                                    logger.info(f"Contact {i+1}: {contact.get('name', 'Unknown')}")
                             elif 'count' in contacts_data:
                                 contact_count = contacts_data['count']
                             
@@ -1877,106 +1964,117 @@ class PropStreamHTMLScraper:
             return False
     
     def prepare_csv_for_upload(self, file_path):
-        """Validate and prepare CSV file for upload to PropStream"""
+        """Prepare CSV file for upload by reformatting it to match PropStream's field structure"""
         try:
             logger.info(f"Preparing CSV file for upload: {file_path}")
             
-            # PropStream expected field names
-            expected_fields = [
-                "First Name", "Middle Name", "Last Name", 
-                "Street Address", "City", "State", "Zip"
+            # Read the original CSV file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                original_content = f.read()
+                
+            # Save a backup of the original file
+            backup_path = f"{file_path}.backup"
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(original_content)
+            logger.info(f"Backup of original CSV saved to: {backup_path}")
+            
+            # Parse the CSV
+            df = pd.read_csv(file_path)
+            logger.info(f"Original CSV columns: {list(df.columns)}")
+            
+            # Check if we need to reformat the CSV
+            propstream_columns = [
+                'First Name', 'Last Name', 'Name', 'Mobile', 'Email', 'Property Address',
+                'City', 'State', 'Zip', 'Mailing Address', 'Type', 'Status'
             ]
             
-            # Read the original CSV
-            original_data = []
-            original_fieldnames = []
+            # If any of our expected columns don't match PropStream's format
+            needs_reformat = True
+            for col in df.columns:
+                if col in propstream_columns:
+                    needs_reformat = False
+                    break
             
-            with open(file_path, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                original_fieldnames = reader.fieldnames or []
-                original_data = list(reader)
-            
-            if not original_data:
-                logger.error("CSV file is empty. PropStream requires at least one contact.")
-                return False
+            if not needs_reformat:
+                logger.info("CSV file already in acceptable format")
+                return file_path
                 
-            logger.info(f"Original CSV has {len(original_data)} rows with headers: {original_fieldnames}")
+            logger.info("Reformatting CSV to match PropStream's expected fields")
             
-            # Check if fields need mapping
-            missing_fields = [field for field in expected_fields if field not in original_fieldnames]
+            # Create a new DataFrame with PropStream's expected format
+            new_df = pd.DataFrame()
             
-            # If any expected fields are missing, we need to map them
-            if missing_fields:
-                logger.warning(f"Missing required fields in CSV: {missing_fields}")
+            # Map fields from the original CSV to PropStream's expected fields
+            if 'First Name' in df.columns and 'Last Name' in df.columns:
+                # Create a Name field from First Name and Last Name
+                new_df['Name'] = df['Last Name'] + ', ' + df['First Name']
+            elif 'Name' in df.columns:
+                new_df['Name'] = df['Name']
                 
-                # Common variations of field names to check
-                field_variations = {
-                    "First Name": ["firstname", "first", "fname", "given name"],
-                    "Middle Name": ["middlename", "middle", "mname"],
-                    "Last Name": ["lastname", "last", "lname", "surname", "family name"],
-                    "Street Address": ["address", "street", "property address", "property street", "addr"],
-                    "City": ["town", "municipality", "property city"],
-                    "State": ["province", "region", "property state"],
-                    "Zip": ["zipcode", "postal code", "zip code", "postal", "property zip"]
-                }
-                
-                # Create field mapping
-                field_mapping = {}
-                for expected_field in missing_fields:
-                    # Check for variations in case-insensitive way
-                    variations = field_variations.get(expected_field, [])
-                    mapped = False
+            # Map address fields
+            address_fields = []
+            for field in ['Street Address', 'Address', 'Property Address']:
+                if field in df.columns:
+                    address_fields.append(field)
+                    break
                     
-                    for field in original_fieldnames:
-                        if field.lower() in [v.lower() for v in variations]:
-                            field_mapping[field] = expected_field
-                            mapped = True
-                            break
+            city_fields = []
+            for field in ['City', 'Property City']:
+                if field in df.columns:
+                    city_fields.append(field)
+                    break
                     
-                    if not mapped:
-                        logger.warning(f"Could not map {expected_field} to any field in the CSV")
-                
-                # If we have mappings, create a new CSV file with correct headers
-                if field_mapping:
-                    logger.info(f"Mapping fields: {field_mapping}")
+            state_fields = []
+            for field in ['State', 'Property State']:
+                if field in df.columns:
+                    state_fields.append(field)
+                    break
                     
-                    new_fieldnames = original_fieldnames.copy()
-                    # Add any missing fields
-                    for expected_field in missing_fields:
-                        if expected_field not in new_fieldnames:
-                            new_fieldnames.append(expected_field)
-                    
-                    # Create new data with mapped fields
-                    new_data = []
-                    for row in original_data:
-                        new_row = row.copy()
-                        
-                        # Apply mappings
-                        for original_field, expected_field in field_mapping.items():
-                            if original_field in row:
-                                new_row[expected_field] = row[original_field]
-                        
-                        # Ensure all fields exist
-                        for field in new_fieldnames:
-                            if field not in new_row:
-                                new_row[field] = ""
-                                
-                        new_data.append(new_row)
-                    
-                    # Save to a new temporary file
-                    temp_file_path = file_path + ".formatted.csv"
-                    with open(temp_file_path, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.DictWriter(f, fieldnames=new_fieldnames)
-                        writer.writeheader()
-                        writer.writerows(new_data)
-                    
-                    logger.info(f"Created formatted CSV file: {temp_file_path}")
-                    return temp_file_path
+            zip_fields = []
+            for field in ['Zip', 'ZIP', 'Zip Code', 'Property Zip']:
+                if field in df.columns:
+                    zip_fields.append(field)
+                    break
             
-            # If no mapping needed, use original file
-            logger.info("CSV file has all required fields, no formatting needed")
-            return file_path
+            # Construct Property Address
+            address_components = []
+            if address_fields:
+                address_components.append(df[address_fields[0]])
+            if city_fields and state_fields:
+                city_state = df[city_fields[0]] + ', ' + df[state_fields[0]]
+                address_components.append(city_state)
+            if zip_fields:
+                address_components.append(df[zip_fields[0]])
+                
+            if address_components:
+                # Combine address components into full address with newline
+                new_df['Property Address'] = address_components[0]
+                if len(address_components) > 1:
+                    new_df['Property Address'] += '\n' + address_components[1]
+                if len(address_components) > 2:
+                    new_df['Property Address'] += ' ' + address_components[2].astype(str)
             
+            # Set default values for required fields
+            if 'Mobile' not in new_df:
+                new_df['Mobile'] = ''
+            if 'Email' not in new_df:
+                new_df['Email'] = ''
+            if 'Mailing Address' not in new_df:
+                new_df['Mailing Address'] = ''
+            if 'Type' not in new_df:
+                new_df['Type'] = 'Other'  # Default type
+            if 'Status' not in new_df:
+                new_df['Status'] = 'New'  # Default status
+                
+            # Generate the output path
+            output_path = f"{os.path.splitext(file_path)[0]}_propstream_format.csv"
+            
+            # Save the reformatted CSV
+            new_df.to_csv(output_path, index=False)
+            logger.info(f"Reformatted CSV saved to: {output_path}")
+            logger.info(f"Reformatted CSV columns: {list(new_df.columns)}")
+            
+            return output_path
         except Exception as e:
             logger.error(f"Error preparing CSV file: {str(e)}")
             import traceback
@@ -2584,6 +2682,10 @@ class PropStreamHTMLScraper:
                 
             logger.info(f"Navigating directly to group page with ID: {group_id}")
             
+            # Add a significant delay to allow PropStream to process the imported contacts
+            logger.info("Waiting 15 seconds for contact import processing to complete...")
+            time.sleep(15)
+            
             # First check if this is a dropdown ID (starting with C)
             if isinstance(group_id, str) and group_id.startswith('C'):
                 # Try direct navigation to the contact URL from screenshot 
@@ -2600,6 +2702,60 @@ class PropStreamHTMLScraper:
             with open("group_page.html", "w", encoding="utf-8") as f:
                 f.write(group_response.text)
                 
+            # Check for import status if file_id is available
+            if file_id:
+                logger.info(f"Checking import status for file ID: {file_id}")
+                import_status_urls = [
+                    f"{self.base_url}/api/contacts/import/status/{file_id}",
+                    f"{self.base_url}/api/contacts/import/{file_id}/status",
+                    f"{self.base_url}/api/contacts/import/file/{file_id}"
+                ]
+                
+                for status_url in import_status_urls:
+                    try:
+                        status_response = self.session.get(status_url)
+                        logger.info(f"Import status response ({status_url}): {status_response.status_code}")
+                        
+                        if status_response.status_code == 200:
+                            with open("import_status.json", "w", encoding="utf-8") as f:
+                                f.write(status_response.text)
+                            
+                            # Try to parse the status
+                            try:
+                                status_data = status_response.json()
+                                logger.info(f"Import status: {json.dumps(status_data, indent=2)}")
+                                
+                                # Check for important status fields
+                                status = status_data.get('status')
+                                if status:
+                                    logger.info(f"Import status field: {status}")
+                                
+                                total = status_data.get('total')
+                                if total:
+                                    logger.info(f"Import total records: {total}")
+                                
+                                imported = status_data.get('imported') or status_data.get('processed')
+                                if imported:
+                                    logger.info(f"Import processed records: {imported}")
+                                
+                                duplicates = status_data.get('duplicates')
+                                if duplicates:
+                                    logger.warning(f"Import duplicate records: {duplicates}")
+                                
+                                errors = status_data.get('errors')
+                                if errors:
+                                    logger.error(f"Import error records: {errors}")
+                                
+                                message = status_data.get('message')
+                                if message:
+                                    logger.info(f"Import status message: {message}")
+                            except Exception as e:
+                                logger.warning(f"Error parsing import status: {str(e)}")
+                            
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error checking import status: {str(e)}")
+            
             # If navigation failed, try alternative URL formats
             if group_response.status_code != 200:
                 # Try different URL format
@@ -2623,61 +2779,134 @@ class PropStreamHTMLScraper:
                         f.write(direct_response.text)
             
             # Force browser to reload the page by adding a timestamp
-            reload_url = f"{self.base_url}/contact/{group_id}?t={int(time.time())}"
+            timestamp = int(time.time())
+            reload_url = f"{self.base_url}/contact/{group_id}?t={timestamp}"
             reload_response = self.session.get(reload_url)
             logger.info(f"Forced reload of group page response: {reload_response.status_code}")
+            
+            # Make multiple attempts to get the updated contact count with different API formats
+            logger.info("Making multiple attempts to get updated contact count...")
+            
+            # Add a delay between API calls to allow for processing
+            time.sleep(5)
             
             # Now specifically request the contacts listing API endpoint to trigger a UI refresh
             # Try multiple formats based on the screenshot URL pattern
             contact_list_urls = [
-                f"{self.base_url}/api/contact-groups/{group_id}/contacts?refresh=true&t={int(time.time())}",
-                f"{self.base_url}/api/contacts/contact-groups/{group_id}/list?refresh=true&t={int(time.time())}",
-                f"{self.base_url}/api/contacts/groups/{group_id}/contacts?refresh=true&t={int(time.time())}"
+                f"{self.base_url}/api/contact-groups/{group_id}/contacts?refresh=true&t={timestamp}",
+                f"{self.base_url}/api/contacts/contact-groups/{group_id}/list?refresh=true&t={timestamp}",
+                f"{self.base_url}/api/contacts/groups/{group_id}/contacts?refresh=true&t={timestamp}",
+                f"{self.base_url}/api/contacts?groupId={group_id}&page=1&pageSize=100&t={timestamp}"
             ]
             
             # If it's a dropdown ID, try without the C prefix
             if isinstance(group_id, str) and group_id.startswith('C'):
                 numeric_id = group_id[1:]
-                contact_list_urls.append(f"{self.base_url}/api/contact-groups/{numeric_id}/contacts?refresh=true&t={int(time.time())}")
-                contact_list_urls.append(f"{self.base_url}/api/contacts/groups/{numeric_id}/contacts?refresh=true&t={int(time.time())}")
+                contact_list_urls.append(f"{self.base_url}/api/contact-groups/{numeric_id}/contacts?refresh=true&t={timestamp}")
+                contact_list_urls.append(f"{self.base_url}/api/contacts/groups/{numeric_id}/contacts?refresh=true&t={timestamp}")
+                contact_list_urls.append(f"{self.base_url}/api/contacts?groupId={numeric_id}&page=1&pageSize=100&t={timestamp}")
             
-            # Try each URL format
+            # Try each URL format multiple times with delays between attempts
+            max_attempts = 3
             contact_count = 0
-            for url in contact_list_urls:
-                list_response = self.session.get(url)
-                logger.info(f"Contact list API response ({url}): {list_response.status_code}")
-                
-                # If successful, save the response for debugging and extract count
-                if list_response.status_code == 200:
-                    with open("contact_list_api.json", "w", encoding="utf-8") as f:
-                        f.write(list_response.text)
-                    logger.info("Successfully triggered contact list refresh")
-                    
-                    # Try to extract the contact count from the response
-                    try:
-                        contact_data = list_response.json()
-                        if isinstance(contact_data, list):
-                            contact_count = len(contact_data)
-                        elif 'items' in contact_data:
-                            contact_count = len(contact_data['items'])
-                        elif 'contacts' in contact_data:
-                            contact_count = len(contact_data['contacts'])
-                        elif 'count' in contact_data:
-                            contact_count = contact_data['count']
-                        
-                        if file_id:
-                            logger.info(f"IMPORTED CONTACTS COUNT: {contact_count} contacts were imported from file ID: {file_id}")
-                        else:
-                            logger.info(f"CONTACTS COUNT: {contact_count} contacts found in group")
-                    except Exception as e:
-                        logger.warning(f"Error extracting contact count: {str(e)}")
-                    
-                    break
+            contacts_found = False
             
-            # Try to get the exact direct URL from the screenshot
-            direct_contact_url = f"{self.base_url}/api/contacts?groupId={group_id}&page=1&pageSize=50&t={int(time.time())}"
-            direct_response = self.session.get(direct_contact_url)
-            logger.info(f"Direct contact list API response: {direct_response.status_code}")
+            for attempt in range(max_attempts):
+                logger.info(f"Contact list retrieval attempt {attempt+1}/{max_attempts}")
+                
+                for url in contact_list_urls:
+                    list_response = self.session.get(url)
+                    logger.info(f"Contact list API response ({url}): {list_response.status_code}")
+                    
+                    # If successful, save the response for debugging and extract count
+                    if list_response.status_code == 200:
+                        with open(f"contact_list_api_attempt{attempt+1}.json", "w", encoding="utf-8") as f:
+                            f.write(list_response.text)
+                        
+                        # Try to extract the contact count from the response
+                        try:
+                            contact_data = list_response.json()
+                            
+                            # Save full response for debugging
+                            with open(f"contact_data_raw_attempt{attempt+1}.json", "w", encoding="utf-8") as f:
+                                f.write(json.dumps(contact_data, indent=2))
+                            
+                            # Try different response formats
+                            if isinstance(contact_data, list):
+                                contact_count = len(contact_data)
+                                # Save the actual contacts for inspection
+                                with open(f"contact_items_attempt{attempt+1}.json", "w", encoding="utf-8") as f:
+                                    f.write(json.dumps(contact_data, indent=2))
+                            elif 'items' in contact_data:
+                                contact_count = len(contact_data['items'])
+                                # Save the actual contacts for inspection
+                                with open(f"contact_items_attempt{attempt+1}.json", "w", encoding="utf-8") as f:
+                                    f.write(json.dumps(contact_data['items'], indent=2))
+                            elif 'contacts' in contact_data:
+                                contact_count = len(contact_data['contacts'])
+                                # Save the actual contacts for inspection
+                                with open(f"contact_items_attempt{attempt+1}.json", "w", encoding="utf-8") as f:
+                                    f.write(json.dumps(contact_data['contacts'], indent=2))
+                            elif 'count' in contact_data:
+                                contact_count = contact_data['count']
+                            
+                            if contact_count > 0:
+                                contacts_found = True
+                                
+                                if file_id:
+                                    logger.info(f"IMPORTED CONTACTS COUNT: {contact_count} contacts were found in group (attempt {attempt+1})")
+                                    logger.info(f"IMPORT SOURCE: File ID: {file_id}")
+                                    
+                                    # Check if contact count is only 1 when we expect more
+                                    if contact_count == 1 and attempt < max_attempts - 1:
+                                        logger.warning("Only 1 contact found but more were expected. Will try again after delay...")
+                                        time.sleep(5)  # Wait before next attempt
+                                        continue
+                                else:
+                                    logger.info(f"CONTACTS COUNT: {contact_count} contacts found in group (attempt {attempt+1})")
+                                
+                                # If we found more than 1 contact, we can stop trying
+                                if contact_count > 1:
+                                    break
+                        except Exception as e:
+                            logger.warning(f"Error extracting contact count: {str(e)}")
+                
+                # If we found satisfactory results, no need for more attempts
+                if contacts_found and contact_count > 1:
+                    break
+                    
+                # Add delay between attempts
+                if attempt < max_attempts - 1:
+                    logger.info(f"Waiting 10 seconds before next contact count attempt...")
+                    time.sleep(10)
+            
+            # If we still didn't find multiple contacts, try one last direct approach
+            if not contacts_found or contact_count <= 1:
+                logger.info("Making final direct attempt to count contacts...")
+                
+                # Try to get the exact direct URL from the screenshot 
+                direct_contact_url = f"{self.base_url}/api/contacts?groupId={group_id}&page=1&pageSize=100&t={int(time.time())}"
+                direct_response = self.session.get(direct_contact_url)
+                logger.info(f"Final direct contact list API response: {direct_response.status_code}")
+                
+                if direct_response.status_code == 200:
+                    with open("final_contact_list.json", "w", encoding="utf-8") as f:
+                        f.write(direct_response.text)
+                    
+                    try:
+                        final_data = direct_response.json()
+                        if isinstance(final_data, list):
+                            contact_count = len(final_data)
+                        elif 'items' in final_data:
+                            contact_count = len(final_data['items'])
+                        elif 'contacts' in final_data:
+                            contact_count = len(final_data['contacts'])
+                        elif 'count' in final_data:
+                            contact_count = final_data['count']
+                        
+                        logger.info(f"FINAL CONTACTS COUNT: {contact_count} contacts in group")
+                    except Exception as e:
+                        logger.warning(f"Error extracting final contact count: {str(e)}")
             
             # Force a final UI refresh by visiting the exact URL in the screenshot
             screenshot_url = f"{self.base_url}/contact/{group_id}"
@@ -2687,6 +2916,16 @@ class PropStreamHTMLScraper:
             # Add some delay to allow the UI to update
             logger.info("Waiting for UI to refresh with updated contacts...")
             time.sleep(5)
+            
+            # Final instructions for the user
+            logger.info("=" * 80)
+            logger.info("IMPORTANT: If contacts are not showing in the PropStream interface:")
+            logger.info("1. Try manually refreshing your browser (F5)")
+            logger.info("2. Wait a few more minutes for PropStream to process the import")
+            logger.info("3. Check for 'Duplicate' notifications in the PropStream interface")
+            logger.info("4. Verify your imported contacts don't match existing contacts")
+            logger.info(f"5. Retry the upload with a fresh browser session")
+            logger.info("=" * 80)
             
             return True
         except Exception as e:
