@@ -188,6 +188,116 @@ class PropStreamHTMLScraper:
             logger.error(f"Error selecting file: {str(e)}")
             return None
     
+    def find_group_by_ui_navigation(self, group_name):
+        """Find a group by navigating the UI instead of using API calls"""
+        try:
+            logger.info(f"Finding group by UI navigation: {group_name}")
+            
+            # Navigate to contacts page
+            contacts_url = f"{self.base_url}/contacts"
+            contacts_response = self.session.get(contacts_url)
+            
+            if contacts_response.status_code != 200:
+                logger.error(f"Failed to access contacts page: {contacts_response.status_code}")
+                return None
+                
+            # Save the contacts page for debugging
+            with open("contacts_page_groups.html", "w", encoding="utf-8") as f:
+                f.write(contacts_response.text)
+                
+            # Parse the HTML
+            soup = BeautifulSoup(contacts_response.text, 'html.parser')
+            
+            # Look for groups in the page
+            # The selectors provided by the user indicate the Groups dropdown and list
+            groups_section = soup.select_one("div.src-app-components-ToggleList-style__HH7QT__body")
+            
+            if not groups_section:
+                logger.warning("Could not find groups section in the page")
+                # Try alternative selectors or structure
+                groups_section = soup.select_one("div[class*='ToggleList'][class*='body']")
+                
+            if groups_section:
+                # Look for the specific group by name
+                group_elements = groups_section.find_all("div")
+                
+                for element in group_elements:
+                    if group_name in element.text:
+                        # Found the group element
+                        group_id_attr = element.get("id") or element.get("data-id")
+                        
+                        # If direct ID isn't available, look for href or other attributes
+                        if not group_id_attr:
+                            link = element.find("a")
+                            if link and link.get("href"):
+                                href = link.get("href")
+                                id_match = re.search(r'[?&]id=([^&]+)', href)
+                                if id_match:
+                                    group_id_attr = id_match.group(1)
+                                    
+                        # If still no ID, look in element attributes or text
+                        if not group_id_attr:
+                            # Look for any attribute that might contain an ID
+                            for attr_name, attr_value in element.attrs.items():
+                                if "id" in attr_name.lower() and attr_value:
+                                    group_id_attr = attr_value
+                                    break
+                                    
+                            # If still no ID, try to extract from onclick or other JavaScript
+                            if not group_id_attr:
+                                onclick = element.get("onclick") or ""
+                                id_match = re.search(r'[\'"]id[\'"]\s*:\s*[\'"]([^\'"]+)[\'"]', onclick)
+                                if id_match:
+                                    group_id_attr = id_match.group(1)
+                                    
+                        # If we found an ID, return it
+                        if group_id_attr:
+                            logger.info(f"Found group '{group_name}' with ID: {group_id_attr} via UI navigation")
+                            return group_id_attr
+                        
+                        # If we found the element but no ID, at least log that we found it
+                        logger.info(f"Found group '{group_name}' in UI but could not extract ID")
+            
+            # If we couldn't find the group by UI navigation, try extracting from full page
+            # Look for any element containing the group name and an ID pattern
+            all_elements = soup.find_all(string=re.compile(re.escape(group_name)))
+            for element in all_elements:
+                parent = element.parent
+                # Look for ID in parent or ancestors
+                for i in range(5):  # Check up to 5 levels up
+                    if not parent:
+                        break
+                        
+                    # Try to find ID in this element
+                    group_id_attr = parent.get("id") or parent.get("data-id")
+                    
+                    # If found ID, return it
+                    if group_id_attr and re.match(r'(group_)?[a-zA-Z0-9]+', group_id_attr):
+                        logger.info(f"Found group '{group_name}' with ID: {group_id_attr} in page elements")
+                        return group_id_attr
+                        
+                    # Check for href with ID
+                    link = parent.find("a")
+                    if link and link.get("href"):
+                        href = link.get("href")
+                        id_match = re.search(r'[?&]id=([^&]+)', href)
+                        if id_match:
+                            group_id_attr = id_match.group(1)
+                            logger.info(f"Found group '{group_name}' with ID: {group_id_attr} in link href")
+                            return group_id_attr
+                            
+                    # Move up to parent
+                    parent = parent.parent
+            
+            logger.warning(f"Could not find group '{group_name}' via UI navigation")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding group by UI navigation: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+            
     def upload_file_and_create_group(self, file_path):
         """Upload file and create a new group"""
         try:
@@ -349,46 +459,52 @@ class PropStreamHTMLScraper:
                         group_id = group_id_match.group(1)
                         logger.info(f"Extracted group ID from response HTML: {group_id}")
                     else:
-                        # Try looking for the group by name
+                        # Try looking for the group by name using UI navigation
                         logger.info(f"Looking for group by name: {group_name}")
                         time.sleep(5)  # Wait a bit before checking
                         
-                        # Get list of groups
-                        groups_url = f"{self.base_url}/api/contact-groups"
-                        # Add retry logic for getting groups
-                        max_retries = 3
-                        retry_delay = 3
-                        
-                        for retry in range(max_retries):
-                            try:
-                                # Get the groups list with retry
-                                groups_response = self.session.get(groups_url)
-                                
-                                # Check if the response is JSON
-                                if groups_response.status_code == 200 and 'application/json' in groups_response.headers.get('Content-Type', ''):
-                                    groups_data = groups_response.json()
-                                    for group in groups_data:
-                                        if group.get('name') == group_name:
-                                            group_id = group.get('id')
-                                            logger.info(f"Found group by name with ID: {group_id}")
-                                            break
+                        # Try UI navigation first as suggested by user
+                        group_id = self.navigate_to_groups_ui(group_name)
+                        if group_id:
+                            logger.info(f"Found group via UI navigation with ID: {group_id}")
+                        else:
+                            # Fall back to API approach if UI navigation fails
+                            logger.info("UI navigation failed, trying API approach")
+                            
+                            # Get list of groups
+                            groups_url = f"{self.base_url}/api/contact-groups"
+                            # Add retry logic for getting groups
+                            max_retries = 3
+                            retry_delay = 3
+                            
+                            for retry in range(max_retries):
+                                try:
+                                    # Get the groups list with retry
+                                    groups_response = self.session.get(groups_url)
                                     
-                                    # If we found the group, break out of retry loop
-                                    if group_id:
-                                        break
-                                else:
-                                    # If not JSON, log and try again
-                                    logger.warning(f"Groups response not JSON (attempt {retry+1}/{max_retries}): {groups_response.status_code}")
+                                    # Check if the response is JSON
+                                    if groups_response.status_code == 200 and 'application/json' in groups_response.headers.get('Content-Type', ''):
+                                        groups_data = groups_response.json()
+                                        for group in groups_data:
+                                            if group.get('name') == group_name:
+                                                group_id = group.get('id')
+                                                logger.info(f"Found group by name with ID: {group_id}")
+                                                break
+                                        
+                                        # If we found the group, break out of retry loop
+                                        if group_id:
+                                            break
+                                    else:
+                                        # If not JSON, log and try again
+                                        logger.warning(f"Groups response not JSON (attempt {retry+1}/{max_retries}): {groups_response.status_code}")
+                                        if retry < max_retries - 1:
+                                            # Wait longer with each retry
+                                            time.sleep(retry_delay * (retry + 1))
+                                except Exception as e:
+                                    logger.warning(f"Error finding group by name (attempt {retry+1}/{max_retries}): {str(e)}")
                                     if retry < max_retries - 1:
                                         # Wait longer with each retry
                                         time.sleep(retry_delay * (retry + 1))
-                                        continue
-                            except Exception as e:
-                                logger.warning(f"Error finding group by name (attempt {retry+1}/{max_retries}): {str(e)}")
-                                if retry < max_retries - 1:
-                                    # Wait longer with each retry
-                                    time.sleep(retry_delay * (retry + 1))
-                                    continue
                         
                         # If we still can't get the group ID, extract it from the URL
                         if not group_id:
@@ -573,8 +689,8 @@ class PropStreamHTMLScraper:
                     logger.info(f"Found {len(contact_ids)} contact IDs from the skip tracing interface")
                 except Exception as e:
                     logger.error(f"Error extracting contact IDs: {str(e)}")
-            else:
-                logger.warning(f"Failed to get contacts: {contacts_response.status_code}")
+                else:
+                    logger.warning(f"Failed to get contacts: {contacts_response.status_code}")
                 
                 # Try alternative method
                 alt_contacts_url = f"{self.base_url}/api/contact-groups/{group_id}/contacts"
@@ -597,8 +713,8 @@ class PropStreamHTMLScraper:
                         # Extract IDs
                         for contact in contacts:
                             contact_id = contact.get('id')
-                            if contact_id:
-                                contact_ids.append(contact_id)
+                        if contact_id:
+                            contact_ids.append(contact_id)
                                 
                         logger.info(f"Found {len(contact_ids)} contact IDs using alternative method")
                     except Exception as e:
@@ -940,12 +1056,12 @@ class PropStreamHTMLScraper:
                 
                 # Try to find contact data in table format
                 # Look for tables that might contain contact data
-                tables = soup.find_all('table')
-                for table in tables:
-                    rows = table.find_all('tr')
+                        tables = soup.find_all('table')
+                        for table in tables:
+                                rows = table.find_all('tr')
                     for row in rows:
-                        cells = row.find_all('td')
-                        if len(cells) >= 3:  # At least name, phone, email
+                                    cells = row.find_all('td')
+                    if len(cells) >= 3:  # At least name, phone, email
                             contact_info = {}
                             
                             # Try to extract name
@@ -1014,8 +1130,8 @@ class PropStreamHTMLScraper:
             if html_contacts:
                 logger.info(f"Found {len(html_contacts)} contacts directly from HTML")
                 self.scraped_data = html_contacts
-                return True
-                
+            return True
+                            
             # If we couldn't extract directly, try the API approach
             lists_url = f"{self.base_url}/api/contacts/lists"
             lists_response = self.session.get(lists_url)
@@ -1177,13 +1293,11 @@ class PropStreamHTMLScraper:
                         if contacts_data:
                             self.scraped_data = contacts_data
                             logger.info(f"Successfully extracted data for {len(contacts_data)} contacts via HTML parsing")
-                            return True
-                        else:
+                        return True
+                    else:
                             logger.error("No contact data found in HTML parsing")
                             return False
-                    else:
-                        logger.error("No contact data found")
-                        return False
+                    
             except Exception as e:
                 logger.error(f"Error extracting contact data: {str(e)}")
                 import traceback
@@ -1638,6 +1752,72 @@ class PropStreamHTMLScraper:
             import traceback
             logger.critical(traceback.format_exc())
             return False
+    
+    def navigate_to_groups_ui(self, group_name=None):
+        """Navigate to the groups section in the PropStream UI using the CSS selectors provided by the user"""
+        try:
+            logger.info("Navigating to groups UI section...")
+            
+            # Step 1: Navigate to contacts page
+            contacts_url = f"{self.base_url}/contacts"
+            contacts_response = self.session.get(contacts_url)
+            
+            if contacts_response.status_code != 200:
+                logger.error(f"Failed to access contacts page: {contacts_response.status_code}")
+                return None
+                
+            # Parse the contacts page
+            soup = BeautifulSoup(contacts_response.text, 'html.parser')
+            
+            # Step 2: Look for the Groups dropdown
+            # Use the CSS selectors provided by the user
+            groups_header = soup.select_one("div.src-app-components-ToggleList-style__iUPFM__header")
+            if not groups_header:
+                # Try alternative selector
+                groups_header = soup.select_one("div[class*='ToggleList'][class*='header']")
+            
+            if not groups_header:
+                logger.warning("Could not find Groups dropdown header")
+                return None
+                
+            # Simulate clicking on the Groups dropdown if needed
+            groups_body = soup.select_one("div.src-app-components-ToggleList-style__HH7QT__body")
+            if not groups_body:
+                # Try alternative selector
+                groups_body = soup.select_one("div[class*='ToggleList'][class*='body']")
+                
+            # Step 3: Find our group in the list
+            if groups_body and group_name:
+                group_elements = groups_body.find_all("div")
+                for element in group_elements:
+                    if group_name in element.text:
+                        # Found our group
+                        group_id = None
+                        
+                        # Try to extract ID from various attributes
+                        group_id = element.get("id") or element.get("data-id")
+                        
+                        # If no direct ID, look for links or other elements
+                        if not group_id:
+                            link = element.find("a")
+                            if link and link.get("href"):
+                                href = link.get("href")
+                                id_match = re.search(r'[?&]id=([^&]+)', href)
+                                if id_match:
+                                    group_id = id_match.group(1)
+                                    
+                        # If we found a group ID, return it
+                        if group_id:
+                            logger.info(f"Found group '{group_name}' with ID: {group_id} in UI navigation")
+                            return group_id
+                            
+                logger.warning(f"Group '{group_name}' not found in UI navigation")
+            
+            return None
+                
+        except Exception as e:
+            logger.error(f"Error navigating to groups UI: {str(e)}")
+            return None
 
 if __name__ == "__main__":
     try:
