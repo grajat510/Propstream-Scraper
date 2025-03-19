@@ -415,7 +415,7 @@ class PropStreamHTMLScraper:
                     break
                 
                 # Wait between status checks
-                time.sleep(10)
+            time.sleep(10)
             
             # Find the existing group 'Foreclosures_scraping_Test'
             logger.info("Finding existing group 'Foreclosures_scraping_Test'...")
@@ -967,7 +967,7 @@ class PropStreamHTMLScraper:
                                         contact_id = row.get('id')
                                         if contact_id:
                                             contact_ids.append(contact_id)
-                                
+                                            
                                 if contact_ids:
                                     logger.info(f"Found {len(contact_ids)} contact IDs from grid data JSON")
                                     break
@@ -975,7 +975,7 @@ class PropStreamHTMLScraper:
                                 # It's not JSON, try parsing as HTML
                                 logger.info("Response is not JSON, trying to parse as HTML...")
                                 grid_soup = BeautifulSoup(grid_response.text, 'html.parser')
-                                
+                                    
                                 # Look for grid rows in the response
                                 html_row_ids = []
                                 grid_rows = grid_soup.select('.ag-row')
@@ -983,7 +983,7 @@ class PropStreamHTMLScraper:
                                     row_id = row.get('row-id')
                                     if row_id:
                                         html_row_ids.append(row_id)
-                                
+                                    
                                 if html_row_ids:
                                     for row_id in html_row_ids:
                                         if row_id not in contact_ids:

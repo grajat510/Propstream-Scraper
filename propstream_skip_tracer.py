@@ -649,7 +649,7 @@ class PropStreamSkipTracer:
             logger.error(traceback.format_exc())
             return None
             
-    def wait_for_order_completion(self, order_id, max_retries=12, wait_interval=10):
+    def wait_for_order_completion(self, order_id, max_retries=12, wait_interval=200):
         """Wait for the skip tracing order to complete"""
         try:
             logger.info(f"Waiting for skip tracing order {order_id} to complete...")
@@ -1137,126 +1137,173 @@ class PropStreamSkipTracer:
             soup = BeautifulSoup(html_content, 'html.parser')
             contacts = []
             
-            # Look for contacts with specific HTML structure as provided by user
+            # First look for grid rows in the AG Grid structure
+            grid_rows = soup.select('.ag-row') or soup.select('.ag-row-even') or soup.select('.ag-row-odd')
+            logger.info(f"Found {len(grid_rows)} grid rows in HTML")
             
-            # 1. Extract names from links with specific class
-            name_links = soup.select('a.src-app-components-SearchTable-style__as2Nk__link')
-            logger.info(f"Found {len(name_links)} name links")
-            
-            if name_links:
-                # Create contacts from name links
-                for name_link in name_links:
-                    contacts.append({
-                        'Name': name_link.text.strip(),
-                        'Mobile Phone': '',
-                        'Landline': '',
-                        'Email': ''
-                    })
-                logger.info(f"Created {len(contacts)} contact entries from name links")
-            
-            # 2. Extract mobile phone numbers
-            mobile_cells = soup.select('[id^="cell-mobilePhone-"]')
-            logger.info(f"Found {len(mobile_cells)} mobile phone cells")
-            
-            # Add mobile numbers to contacts if they exist
-            for i, mobile_cell in enumerate(mobile_cells):
-                if i < len(contacts):
-                    contacts[i]['Mobile Phone'] = mobile_cell.text.strip()
-                else:
-                    # Create a new contact if there's no matching contact yet
-                    contacts.append({
-                        'Name': f"Contact {i+1}",
-                        'Mobile Phone': mobile_cell.text.strip(),
-                        'Landline': '',
-                        'Email': ''
-                    })
-            
-            # 3. Extract landline phone numbers
-            landline_cells = soup.select('[id^="cell-landlinePhone-"]')
-            logger.info(f"Found {len(landline_cells)} landline phone cells")
-            
-            # Add landline numbers to contacts if they exist
-            for i, landline_cell in enumerate(landline_cells):
-                if i < len(contacts):
-                    contacts[i]['Landline'] = landline_cell.text.strip()
-                else:
-                    # Create a new contact if there's no matching contact yet
-                    contacts.append({
-                        'Name': f"Contact {i+1}",
-                        'Mobile Phone': '',
-                        'Landline': landline_cell.text.strip(),
-                        'Email': ''
-                    })
-            
-            # 4. Extract email addresses
-            email_cells = soup.select('[col-id="email"]')
-            logger.info(f"Found {len(email_cells)} email cells")
-            
-            # Add emails to contacts if they exist
-            for i, email_cell in enumerate(email_cells):
-                if i < len(contacts):
-                    contacts[i]['Email'] = email_cell.text.strip()
-                else:
-                    # Create a new contact if there's no matching contact yet
-                    contacts.append({
-                        'Name': f"Contact {i+1}",
-                        'Mobile Phone': '',
-                        'Landline': '',
-                        'Email': email_cell.text.strip()
-                    })
-            
-            # If no contacts were found with the above methods, try looking for grid rows
-            if not contacts:
-                logger.info("No contacts found using specific selectors, trying grid rows...")
+            # If there are no rows, look for cells directly
+            if not grid_rows:
+                logger.info("No grid rows found, looking for cells directly...")
                 
-                # Look for grid rows in the AG Grid structure
-                grid_rows = soup.select('.ag-row') or soup.select('.ag-row-even') or soup.select('.ag-row-odd')
-                logger.info(f"Found {len(grid_rows)} grid rows in HTML")
+                # Check for mobile phone cells using the selector provided
+                mobile_cells = soup.select('[id^="cell-mobilePhone-"]')
+                landline_cells = soup.select('[id^="cell-landlinePhone-"]')
                 
-                # Process each grid row if we found them
-                for row_index, row in enumerate(grid_rows):
-                    contact = {}
+                logger.info(f"Found {len(mobile_cells)} mobile cells and {len(landline_cells)} landline cells")
+                
+                # If we found cells but not rows, try to reconstruct contacts
+                if mobile_cells or landline_cells:
+                    max_rows = max(len(mobile_cells), len(landline_cells))
                     
-                    # Extract name from search table link
-                    name_link = row.select_one('a.src-app-components-SearchTable-style__as2Nk__link')
-                    if name_link:
-                        contact['Name'] = name_link.text.strip()
-                    else:
-                        # Alternative selectors for name
-                        name_cell = row.select_one('[col-id="name"]') or row.select_one('[field="name"]')
-                        if name_cell:
-                            contact['Name'] = name_cell.text.strip()
+                    for i in range(max_rows):
+                        contact = {'Name': f"Contact {i+1}"}
+                        
+                        if i < len(mobile_cells):
+                            contact['Mobile Phone'] = mobile_cells[i].text.strip()
                         else:
-                            contact['Name'] = f"Contact {row_index+1}"
+                            contact['Mobile Phone'] = ''
+                            
+                        if i < len(landline_cells):
+                            contact['Landline'] = landline_cells[i].text.strip()
+                        else:
+                            contact['Landline'] = ''
+                            
+                            # Other fields would be empty as we don't have a row context
+                            contact['Other Phone'] = ''
+                            contact['Email'] = ''
+                            
+                            contacts.append(contact)
                     
-                    # Extract mobile phone using specific selector from user
-                    mobile_cell = row.select_one('[id^="cell-mobilePhone-"]')
-                    if mobile_cell:
-                        contact['Mobile Phone'] = mobile_cell.text.strip()
-                    else:
-                        # Alternative selectors
-                        mobile_cell = row.select_one('[col-id="mobilePhone"]') or row.select_one('[field="mobilePhone"]')
-                        contact['Mobile Phone'] = mobile_cell.text.strip() if mobile_cell else ''
-                    
-                    # Extract landline phone using specific selector from user
-                    landline_cell = row.select_one('[id^="cell-landlinePhone-"]')
-                    if landline_cell:
-                        contact['Landline'] = landline_cell.text.strip()
-                    else:
-                        # Alternative selectors
-                        landline_cell = row.select_one('[col-id="landlinePhone"]') or row.select_one('[field="landlinePhone"]')
-                        contact['Landline'] = landline_cell.text.strip() if landline_cell else ''
-                    
-                    # Extract email
-                    email_cell = row.select_one('[col-id="email"]')
-                    if email_cell:
-                        contact['Email'] = email_cell.text.strip()
-                    else:
-                        contact['Email'] = ''
-                    
-                    contacts.append(contact)
+                    logger.info(f"Reconstructed {len(contacts)} contacts from cells")
+                    return contacts
                 
-                logger.info(f"Extracted {len(contacts)} contacts from grid rows")
+                # Try universal selector patterns
+                name_cells = soup.select('[col-id="name"]') or soup.select('[field="name"]')
+                mobile_cells = soup.select('[col-id="mobilePhone"]') or soup.select('[field="mobilePhone"]')
+                landline_cells = soup.select('[col-id="landlinePhone"]') or soup.select('[field="landlinePhone"]')
+                
+                logger.info(f"Found {len(name_cells)} name cells using alternative selectors")
+                
+                if name_cells:
+                    for i in range(len(name_cells)):
+                        contact = {'Name': name_cells[i].text.strip()}
+                        
+                        if i < len(mobile_cells):
+                            contact['Mobile Phone'] = mobile_cells[i].text.strip()
+                        else:
+                            contact['Mobile Phone'] = ''
+                            
+                        if i < len(landline_cells):
+                            contact['Landline'] = landline_cells[i].text.strip()
+                        else:
+                            contact['Landline'] = ''
+                            
+                            contact['Other Phone'] = ''
+                            contact['Email'] = ''
+                            
+                            contacts.append(contact)
+                        
+                    logger.info(f"Reconstructed {len(contacts)} contacts from alternative selectors")
+                    return contacts
+            
+            # Process each grid row if we found them
+            for row_index, row in enumerate(grid_rows):
+                contact = {}
+                
+                # Extract name (typically first column)
+                name_cell = row.select_one('[col-id="name"]') or row.select_one('[field="name"]')
+                if name_cell:
+                    contact['Name'] = name_cell.text.strip()
+                else:
+                    # If no specific name cell, just use first cell or set a placeholder
+                    first_cell = row.select_one('.ag-cell:first-child')
+                    if first_cell:
+                        contact['Name'] = first_cell.text.strip()
+                    else:
+                        contact['Name'] = f"Contact {row_index+1}"
+                
+                # Extract mobile phone using specific selector from user
+                mobile_cell = row.select_one('[id^="cell-mobilePhone-"]')
+                if mobile_cell:
+                    contact['Mobile Phone'] = mobile_cell.text.strip()
+                else:
+                    # Alternative selectors
+                    mobile_cell = row.select_one('[col-id="mobilePhone"]') or row.select_one('[field="mobilePhone"]')
+                    contact['Mobile Phone'] = mobile_cell.text.strip() if mobile_cell else ''
+                
+                # Extract landline phone using specific selector from user
+                landline_cell = row.select_one('[id^="cell-landlinePhone-"]')
+                if landline_cell:
+                    contact['Landline'] = landline_cell.text.strip()
+                else:
+                    # Alternative selectors
+                    landline_cell = row.select_one('[col-id="landlinePhone"]') or row.select_one('[field="landlinePhone"]')
+                    contact['Landline'] = landline_cell.text.strip() if landline_cell else ''
+                
+                # Extract other phone (typically 4th column)
+                other_phone_cell = row.select_one('[col-id="otherPhone"]') or row.select_one('[field="otherPhone"]')
+                contact['Other Phone'] = other_phone_cell.text.strip() if other_phone_cell else ''
+                
+                # Extract email (typically 5th column)
+                email_cell = row.select_one('[col-id="email"]') or row.select_one('[field="email"]')
+                contact['Email'] = email_cell.text.strip() if email_cell else ''
+                
+                # Only add if we have a name and at least one phone number
+                if contact['Name'] and (contact['Mobile Phone'] or contact['Landline'] or contact['Other Phone']):
+                    contacts.append(contact)
+            
+            logger.info(f"Extracted {len(contacts)} contacts from grid rows")
+            
+            # If we didn't find contacts with the grid, try an alternative approach
+            if not contacts:
+                logger.info("No contacts found in grid rows, trying alternative extraction...")
+                
+                # Look for table structure
+                table_rows = soup.select('table tr') or soup.select('tbody tr')
+                if table_rows:
+                    logger.info(f"Found {len(table_rows)} table rows")
+                    
+                    for row_index, row in enumerate(table_rows[1:]):  # Skip header row
+                        cells = row.select('td')
+                        if len(cells) >= 3:
+                            contact = {
+                                'Name': cells[0].text.strip(),
+                                'Mobile Phone': cells[1].text.strip() if len(cells) > 1 else '',
+                                'Landline': cells[2].text.strip() if len(cells) > 2 else '',
+                                'Other Phone': cells[3].text.strip() if len(cells) > 3 else '',
+                                'Email': cells[4].text.strip() if len(cells) > 4 else ''
+                            }
+                            contacts.append(contact)
+                    
+                    logger.info(f"Extracted {len(contacts)} contacts from table rows")
+            
+            # One more attempt with div structure if we still don't have contacts
+            if not contacts:
+                logger.info("Trying div-based extraction as last resort...")
+                name_divs = soup.select('.contact-name') or soup.select('.name')
+                
+                if name_divs:
+                    logger.info(f"Found {len(name_divs)} name divs")
+                    
+                    for i, name_div in enumerate(name_divs):
+                        contact_row = name_div.find_parent('div', class_=lambda c: c and ('row' in c or 'item' in c))
+                        
+                        if contact_row:
+                            mobile_div = contact_row.select_one('.mobile') or contact_row.select_one('.mobile-phone')
+                            landline_div = contact_row.select_one('.landline') or contact_row.select_one('.landline-phone')
+                            other_div = contact_row.select_one('.other') or contact_row.select_one('.other-phone')
+                            email_div = contact_row.select_one('.email')
+                            
+                            contact = {
+                                'Name': name_div.text.strip(),
+                                'Mobile Phone': mobile_div.text.strip() if mobile_div else '',
+                                'Landline': landline_div.text.strip() if landline_div else '',
+                                'Other Phone': other_div.text.strip() if other_div else '',
+                                'Email': email_div.text.strip() if email_div else ''
+                            }
+                            contacts.append(contact)
+                    
+                    logger.info(f"Extracted {len(contacts)} contacts from div structure")
             
             return contacts
         except Exception as e:
@@ -1361,216 +1408,6 @@ class PropStreamSkipTracer:
             logger.error(traceback.format_exc())
             return False
 
-    def extract_data_from_saved_list(self, list_name=None):
-        """Directly navigate to a saved skip trace list and extract the data"""
-        try:
-            logger.info("Extracting data from saved skip trace list...")
-            
-            # Use the saved list name if not provided
-            if not list_name and hasattr(self, 'skip_trace_list_name') and self.skip_trace_list_name:
-                list_name = self.skip_trace_list_name
-                logger.info(f"Using saved skip trace list name: {list_name}")
-            
-            # If we still don't have a list name, try to read it from file
-            if not list_name and os.path.exists("skip_trace_list_name.txt"):
-                with open("skip_trace_list_name.txt", "r", encoding="utf-8") as f:
-                    list_name = f.read().strip()
-                    logger.info(f"Loaded skip trace list name from file: {list_name}")
-                    
-            if not list_name:
-                logger.error("No list name provided or found")
-                return False
-                
-            # First navigate to the contacts page
-            contacts_url = f"{self.base_url}/contacts"
-            contacts_response = self.session.get(contacts_url)
-            
-            if contacts_response.status_code != 200:
-                logger.error(f"Failed to access contacts page: {contacts_response.status_code}")
-                return False
-                
-            # Save the contacts page HTML for debugging
-            with open("contacts_main_page.html", "w", encoding="utf-8") as f:
-                f.write(contacts_response.text)
-            logger.info("Saved contacts main page HTML for debugging")
-            
-            # Find the Skip Tracing section in the left panel
-            soup = BeautifulSoup(contacts_response.text, 'html.parser')
-            skip_tracing_section = None
-            
-            # Find the Skip Tracing header
-            skip_headers = soup.find_all(string=lambda text: text and "Skip Tracing" in text)
-            for header in skip_headers:
-                parent_section = header.find_parent('div', class_=lambda c: c and 'section' in c)
-                if parent_section:
-                    skip_tracing_section = parent_section
-                    logger.info("Found Skip Tracing section in left panel")
-                    break
-            
-            # Extract the job ID from the HTML
-            target_job_id = None
-            
-            if skip_tracing_section:
-                # Look for the specific list by name
-                list_items = skip_tracing_section.find_all(string=lambda text: text and list_name in text)
-                
-                for item in list_items:
-                    logger.info(f"Found potential match: {item}")
-                    # Go up the DOM tree to find the containing element with an ID or data attribute
-                    parent = item.parent
-                    while parent and not target_job_id:
-                        # Check various attributes that might contain the ID
-                        for attr in ['id', 'data-id', 'data-value', 'data-group-id']:
-                            if parent.has_attr(attr):
-                                target_job_id = parent[attr]
-                                logger.info(f"Found job ID: {target_job_id}")
-                                break
-                        
-                        # Look for href attributes in links
-                        links = parent.select('a[href]')
-                        for link in links:
-                            href = link.get('href')
-                            if href and '/contact/' in href:
-                                target_job_id = href.split('/')[-1]
-                                logger.info(f"Extracted job ID from link: {target_job_id}")
-                                break
-                        
-                        # Move up to the next parent
-                        parent = parent.parent
-                        
-                        # Break if we've gone too far up
-                        if parent and parent.name == 'body':
-                            break
-                            
-                    if target_job_id:
-                        break
-            
-            # If we couldn't find the ID, we'll try using list name as a fallback
-            if not target_job_id:
-                logger.warning(f"Couldn't find job ID, using list name as fallback")
-                # Try to navigate directly using the list name or a derived URL
-                clean_name = list_name.replace('/', '-').replace(' ', '-')
-                target_job_id = clean_name
-            
-            # Now navigate to the job's page
-            logger.info(f"Navigating to job with ID: {target_job_id}")
-            
-            # Try different URL formats
-            urls_to_try = [
-                f"{self.base_url}/contact/{target_job_id}",
-                f"{self.base_url}/contacts/{target_job_id}",
-                f"{self.base_url}/skip-tracing/results/{target_job_id}"
-            ]
-            
-            job_response = None
-            for url in urls_to_try:
-                logger.info(f"Trying URL: {url}")
-                current_response = self.session.get(url)
-                
-                if current_response.status_code == 200:
-                    job_response = current_response
-                    logger.info(f"Successfully accessed job at: {url}")
-                    
-                    # Save the job page HTML for debugging
-                    with open("job_page.html", "w", encoding="utf-8") as f:
-                        f.write(job_response.text)
-                    logger.info("Saved job page HTML for debugging")
-                    break
-                else:
-                    logger.warning(f"Failed to access {url}: {current_response.status_code}")
-            
-            if not job_response:
-                logger.error("Failed to access job page with any URL format")
-                return False
-            
-            # Parse the job page HTML to extract contact data
-            contacts_data = self.extract_contact_data_from_html(job_response.text)
-            
-            if not contacts_data:
-                logger.warning("No contacts found in job page HTML, trying API")
-                
-                # Try API endpoints to get the data
-                api_urls = [
-                    f"{self.base_url}/api/contacts/groups/{target_job_id}/contacts",
-                    f"{self.base_url}/api/contact-groups/{target_job_id}/contacts",
-                    f"{self.base_url}/api/skip-tracing/results/{target_job_id}",
-                    f"{self.base_url}/api/contacts?groupId={target_job_id}&page=1&pageSize=100"
-                ]
-                
-                for api_url in api_urls:
-                    logger.info(f"Trying API URL: {api_url}")
-                    api_response = self.session.get(api_url)
-                    
-                    if api_response.status_code == 200:
-                        try:
-                            data = api_response.json()
-                            
-                            # Save the API response for debugging
-                            with open(f"api_response_{api_urls.index(api_url)}.json", "w", encoding="utf-8") as f:
-                                json.dump(data, f, indent=4)
-                            
-                            # Extract contacts from the API response
-                            if isinstance(data, list) and len(data) > 0:
-                                api_contacts = data
-                            elif 'items' in data and isinstance(data['items'], list):
-                                api_contacts = data['items']
-                            elif 'contacts' in data and isinstance(data['contacts'], list):
-                                api_contacts = data['contacts']
-                            else:
-                                api_contacts = []
-                                
-                            if api_contacts:
-                                logger.info(f"Found {len(api_contacts)} contacts via API")
-                                
-                                # Convert to our format
-                                for contact in api_contacts:
-                                    contact_data = {
-                                        'Name': contact.get('name', ''),
-                                        'Mobile Phone': contact.get('mobilePhone', ''),
-                                        'Landline': contact.get('landlinePhone', ''),
-                                        'Email': contact.get('email', '')
-                                    }
-                                    contacts_data.append(contact_data)
-                                    
-                                logger.info(f"Added {len(contacts_data)} contacts from API")
-                                break
-                        except Exception as e:
-                            logger.warning(f"Error parsing API response: {str(e)}")
-            
-            # Store the extracted data
-            self.skip_traced_data = contacts_data
-            
-            # Count how many contacts have phone data
-            contacts_with_phones = sum(1 for c in self.skip_traced_data if c.get('Mobile Phone') or c.get('Landline'))
-            logger.info(f"Extracted {len(self.skip_traced_data)} contacts with {contacts_with_phones} having phone data")
-            
-            # Save to CSV
-            output_file = f"extracted_{list_name.replace('/', '-').replace(' ', '_')}.csv"
-            self.save_data_to_csv(output_file)
-            
-            return True
-        except Exception as e:
-            logger.error(f"Error extracting data from saved list: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
 if __name__ == "__main__":
     tracer = PropStreamSkipTracer()
-    
-    # Check if we have a saved list name from a previous run
-    if os.path.exists("skip_trace_list_name.txt"):
-        with open("skip_trace_list_name.txt", "r", encoding="utf-8") as f:
-            saved_list_name = f.read().strip()
-            if saved_list_name:
-                logger.info(f"Found saved list name: {saved_list_name}")
-                
-                # First login
-                if tracer.login():
-                    # Extract data directly from the saved list
-                    tracer.extract_data_from_saved_list(saved_list_name)
-                else:
-                    logger.error("Login failed, cannot extract data from saved list")
-    else:
-        # No saved list name, run the full process
-        tracer.run()
+    tracer.run()

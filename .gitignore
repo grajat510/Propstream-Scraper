@@ -3,3 +3,5 @@ propstream_contacts.csv
 .env
 propstream_scraper.log
 *.html
+*.log
+*.txt
