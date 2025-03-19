@@ -74,19 +74,34 @@ class PropStreamPlaywrightScraper:
         self.browser = await playwright.chromium.launch(
             headless=headless, 
             slow_mo=slow_mo,
-            args=["--disable-web-security", "--disable-features=IsolateOrigins,site-per-process"]
+            args=[
+                "--disable-web-security", 
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-notifications"
+            ]
         )
         
+        # Configure browser context with permissions already blocked
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            ignore_https_errors=True
+            ignore_https_errors=True,
+            # Set geolocation to a fixed position (optional)
+            geolocation={"latitude": 37.7749, "longitude": -122.4194}
         )
+        
+        # Grant or deny permissions explicitly - this is the correct way to block geolocation
+        await self.context.clear_permissions()  # Clear any existing permissions
+        # Using the permissions API correctly - we don't grant geolocation permission
+        await self.context.grant_permissions([], origin=self.base_url)
         
         # Set longer timeouts
         self.context.set_default_timeout(120000)  # 2 minutes timeout
         
         self.page = await self.context.new_page()
+        
+        # Set up JavaScript dialog handler
+        self.page.on("dialog", lambda dialog: asyncio.create_task(self.handle_dialog(dialog)))
         
         # Enable request/response logging
         self.page.on("request", lambda request: logger.debug(f">> Request: {request.method} {request.url}"))
@@ -105,6 +120,36 @@ class PropStreamPlaywrightScraper:
         
         # Enable JavaScript console logging
         self.page.on("console", lambda msg: logger.debug(f"CONSOLE: {msg.text}"))
+        
+        # Override geolocation using Context API instead of page
+        try:
+            # Modern Playwright versions use context.set_geolocation
+            await self.context.set_geolocation({"latitude": 37.7749, "longitude": -122.4194})
+            logger.info("Set geolocation using context.set_geolocation")
+        except AttributeError:
+            # We already set geolocation during context creation, so this is just a fallback
+            logger.info("Using geolocation already set during context creation")
+        
+        # Execute JavaScript to override geolocation
+        await self.page.evaluate("""() => {
+            // Mock the geolocation API
+            const mockGeolocation = {
+                getCurrentPosition: (success, error) => {
+                    error({ code: 1, message: 'User denied geolocation' });
+                    return true;
+                },
+                watchPosition: (success, error) => {
+                    error({ code: 1, message: 'User denied geolocation' });
+                    return 0;
+                },
+                clearWatch: () => {}
+            };
+            
+            // Replace the actual geolocation API with our mock
+            if (navigator.geolocation) {
+                navigator.geolocation = mockGeolocation;
+            }
+        }""")
         
         return self.page
     
@@ -133,6 +178,9 @@ class PropStreamPlaywrightScraper:
             
             logger.info("Login successful")
             
+            # Handle location permissions and other prompts that might appear
+            await self.handle_permission_prompts()
+            
             # After login, check for and handle the PropStream updates popup
             try:
                 # Take a screenshot to see what's on screen
@@ -141,32 +189,16 @@ class PropStreamPlaywrightScraper:
                 # Wait for the PropStream updates popup to appear
                 logger.info("Checking for PropStream updates popup...")
                 
-                # Look for the Close button in the updates popup
-                close_button_selectors = [
-                    'button:has-text("Close")',
-                    '.close-button',
-                    '.modal-close',
-                    '.popup-close',
-                    'button:below(div:has-text("PROPSTREAM Updates"))'
-                ]
-                
-                for selector in close_button_selectors:
-                    try:
-                        if await self.page.query_selector(selector):
-                            logger.info(f"Found Close button with selector: {selector}")
-                            await self.page.click(selector, timeout=5000)
-                            logger.info("Clicked Close button on updates popup")
-                            break
-                    except Exception as e:
-                        logger.debug(f"Could not click Close button with selector {selector}: {str(e)}")
-                
-                # Wait a moment for the popup to disappear
-                await asyncio.sleep(2)
+                # Handle updates popup or any other popups
+                await self.handle_all_popups()
                 
                 # Navigate to the main dashboard URL
                 dashboard_url = "https://app.propstream.com/"
                 logger.info(f"Navigating to main dashboard: {dashboard_url}")
                 await self.page.goto(dashboard_url, wait_until="networkidle")
+                
+                # Check again for any popups after navigating to dashboard
+                await self.handle_permission_prompts()
                 
                 # Take a screenshot after handling the popup
                 await self.page.screenshot(path="after_popup_handling.png")
@@ -190,329 +222,830 @@ class PropStreamPlaywrightScraper:
             await self.page.screenshot(path="login_error.png")
             return False
     
+    async def handle_permission_prompts(self):
+        """Handle browser permission prompts like location access"""
+        logger.info("Checking for permission prompts...")
+        
+        # Take a screenshot to see what's on the page
+        await self.page.screenshot(path="before_permission_handling.png")
+        
+        try:
+            # Look for location permission dialogs
+            permission_buttons = [
+                'button:has-text("Block")',
+                'button:has-text("Don\'t Allow")',
+                'button:has-text("No")',
+                'button:has-text("Reject")',
+                'button:has-text("Cancel")',
+                'button:has-text("Later")',
+                '[aria-label="Deny"]',
+                '[aria-label="Block"]',
+                'button[id*="deny"]',
+                'button[id*="block"]',
+                '.deny-button',
+                '.block-button'
+            ]
+            
+            for selector in permission_buttons:
+                try:
+                    # Check if element exists and is visible
+                    button = await self.page.query_selector(selector)
+                    if button and await button.is_visible():
+                        logger.info(f"Found permission button with selector: {selector}")
+                        await button.click()
+                        logger.info(f"Clicked permission button: {selector}")
+                        await asyncio.sleep(1)
+                        await self.page.screenshot(path="after_permission_button_click.png")
+                except Exception as e:
+                    logger.debug(f"Error handling permission button {selector}: {str(e)}")
+            
+            # Check for location prompts by looking for elements containing location-related text
+            location_prompts = await self.page.query_selector_all('div:has-text("location"), div:has-text("Location"), div:has-text("Know your location")')
+            for prompt in location_prompts:
+                if await prompt.is_visible():
+                    logger.info("Found possible location prompt")
+                    
+                    # Look for buttons within the prompt
+                    buttons = await prompt.query_selector_all('button')
+                    for button in buttons:
+                        button_text = await button.inner_text()
+                        logger.info(f"Found button in location prompt: {button_text}")
+                        
+                        # Click on block/deny/cancel buttons
+                        if any(word in button_text.lower() for word in ["block", "deny", "don't allow", "no", "cancel", "reject"]):
+                            logger.info(f"Clicking location prompt button: {button_text}")
+                            await button.click()
+                            await asyncio.sleep(1)
+                            await self.page.screenshot(path="after_location_prompt_button_click.png")
+                            break
+            
+            # Try to handle permissions using JavaScript dialog handler
+            self.page.on("dialog", lambda dialog: asyncio.create_task(self.handle_dialog(dialog)))
+            
+        except Exception as e:
+            logger.warning(f"Error handling permission prompts: {str(e)}")
+
+    async def handle_dialog(self, dialog):
+        """Handle JavaScript dialogs like alerts, confirms, prompts"""
+        logger.info(f"Dialog appeared: {dialog.message}")
+        # For confirmation dialogs, dismiss/cancel them
+        if dialog.type == "confirm" or dialog.type == "prompt":
+            await dialog.dismiss()
+            logger.info("Dialog dismissed")
+        else:
+            # For alerts, just acknowledge them
+            await dialog.accept()
+            logger.info("Dialog accepted")
+
+    async def handle_all_popups(self):
+        """Handle all types of popups including PropStream updates"""
+        logger.info("Handling all possible popups...")
+        
+        # Look for various close buttons in popups
+        popup_buttons = [
+            # Close buttons
+            'button:has-text("Close")',
+            '.close-button',
+            '.modal-close',
+            '.popup-close',
+            'span.close',
+            'button.btn-close',
+            'button:has-text("×")',
+            'button:below(div:has-text("PROPSTREAM Updates"))',
+            
+            # Block/cancel location buttons
+            'button:has-text("Block")',
+            'button:has-text("Don\'t Allow")',
+            'button:has-text("No")',
+            'button:has-text("Reject")',
+            'button:has-text("Cancel")',
+            'button:has-text("Later")',
+            
+            # Additional selectors
+            '[aria-label="Close"]',
+            '[aria-label="Dismiss"]',
+            '[aria-label="Cancel"]',
+            '[aria-label="Block"]',
+            '[aria-label="Deny"]'
+        ]
+        
+        # Check each button type
+        for selector in popup_buttons:
+            try:
+                # Find all matching elements
+                elements = await self.page.query_selector_all(selector)
+                for element in elements:
+                    if await element.is_visible():
+                        # Take a screenshot before clicking
+                        safe_selector = selector.replace(':', '_').replace('"', '')
+                        await self.page.screenshot(path=f"before_clicking_{safe_selector}.png")
+                        
+                        # Get button text if possible
+                        try:
+                            button_text = await element.inner_text()
+                            logger.info(f"Found popup button: '{button_text}' with selector: {selector}")
+                        except:
+                            logger.info(f"Found popup button with selector: {selector}")
+                        
+                        # Click the button
+                        await element.click()
+                        logger.info(f"Clicked popup button with selector: {selector}")
+                        
+                        # Wait a moment for the popup to close
+                        await asyncio.sleep(1)
+                        
+                        # Take another screenshot
+                        await self.page.screenshot(path=f"after_clicking_{safe_selector}.png")
+            except Exception as e:
+                logger.debug(f"Error handling popup with selector {selector}: {str(e)}")
+        
+        # Check for modals and overlays that might need to be clicked outside of
+        modal_selectors = ['.modal', '.dialog', '.overlay', '[role="dialog"]']
+        for selector in modal_selectors:
+            try:
+                modal = await self.page.query_selector(selector)
+                if modal and await modal.is_visible():
+                    logger.info(f"Found modal/overlay with selector: {selector}")
+                    # Try to click outside
+                    await self.page.mouse.click(10, 10)
+                    logger.info("Clicked outside modal to dismiss it")
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.debug(f"Error handling modal with selector {selector}: {str(e)}")
+
+    async def check_for_upload_dialog(self):
+        """Check if the file upload dialog is visible"""
+        logger.info("Checking for file upload dialog...")
+        await self.page.screenshot(path="before_upload_dialog_check.png")
+        
+        # First, check if we're on a page that might contain a file upload
+        current_url = self.page.url
+        logger.info(f"Current URL while checking for upload dialog: {current_url}")
+        
+        # Wait a bit longer for the dialog to appear
+        await asyncio.sleep(3)
+        
+        upload_selectors = [
+            'input[type="file"]',
+            '.file-upload',
+            '.upload-area',
+            '[data-testid="file-upload"]',
+            'div:has-text("Upload File")',
+            'div:has-text("Choose File")',
+            'div:has-text("Select File")',
+            'div:has-text("Drag and drop")',
+            'div[role="dialog"]', # General dialog check
+            'div.modal',          # Modal check
+            'div.file-input',
+            'input[accept=".csv"]'
+        ]
+        
+        for selector in upload_selectors:
+            try:
+                element = await self.page.query_selector(selector)
+                if element and await element.is_visible():
+                    logger.info(f"Found file upload element with selector: {selector}")
+                    
+                    # Take a screenshot of the found element
+                    safe_selector = selector.replace(':', '_').replace('[', '_').replace(']', '_').replace('"', '_').replace('*', '_').replace('=', '_')
+                    await element.screenshot(path=f"found_upload_element_{safe_selector}.png")
+                    return True
+            except Exception as e:
+                logger.debug(f"Error checking selector {selector}: {str(e)}")
+        
+        # Try using JavaScript to find an upload dialog or file input
+        logger.info("Using JavaScript to look for file input elements")
+        has_file_input = await self.page.evaluate('''() => {
+            // Look for file inputs
+            const fileInputs = document.querySelectorAll('input[type="file"]');
+            console.log(`Found ${fileInputs.length} file inputs`);
+            
+            if (fileInputs.length > 0) {
+                return true;
+            }
+            
+            // Look for elements with certain attributes
+            const possibleFileElements = document.querySelectorAll('[accept], [type="file"], [class*="upload"], [class*="file"], [id*="upload"], [id*="file"], [aria-label*="upload"], [aria-label*="file"]');
+            console.log(`Found ${possibleFileElements.length} possible file-related elements`);
+            
+            // Look for text indicating file upload
+            const bodyText = document.body.innerText.toLowerCase();
+            const hasUploadText = bodyText.includes('upload') || 
+                                 bodyText.includes('choose file') || 
+                                 bodyText.includes('select file') || 
+                                 bodyText.includes('drag and drop') ||
+                                 bodyText.includes('import file') ||
+                                 bodyText.includes('browse');
+                                 
+            console.log(`Page ${hasUploadText ? 'contains' : 'does not contain'} upload-related text`);
+            
+            // Take all text nodes and print them for debugging
+            const textNodes = [];
+            document.querySelectorAll('*').forEach(el => {
+                if (el.childNodes && 
+                    el.childNodes.length === 1 && 
+                    el.childNodes[0].nodeType === Node.TEXT_NODE &&
+                    el.childNodes[0].textContent.trim()) {
+                    textNodes.push(el.childNodes[0].textContent.trim());
+                }
+            });
+            
+            console.log("Text nodes on page:", textNodes.slice(0, 20)); // Log first 20 text nodes
+            
+            return possibleFileElements.length > 0 || hasUploadText;
+        }''')
+        
+        if has_file_input:
+            logger.info("JavaScript found potential file upload elements")
+            
+            # Take a full page screenshot
+            await self.page.screenshot(path="js_found_upload_elements.png")
+            return True
+                
+        logger.info("No file upload dialog detected")
+        return False
+    
     async def import_file(self, file_path):
         """Import a file to PropStream and create a new group"""
         logger.info(f"Importing file: {file_path}")
         try:
-            # Make sure we're on the main dashboard
-            await self.page.goto(f"{self.base_url}", wait_until="networkidle")
-            logger.info("Navigated to dashboard")
+            # Navigate directly to the contacts page
+            logger.info("Navigating directly to contacts page to find the Import button")
+            await self.page.goto(f"{self.base_url}/contact", wait_until="networkidle")
+            await asyncio.sleep(3)
             
-            # Take a screenshot of the dashboard for debugging
-            await self.page.screenshot(path="dashboard.png")
+            # Take a screenshot of the contacts page
+            await self.page.screenshot(path="contacts_page_direct.png")
             
-            # Wait a moment for any popups to appear
-            await asyncio.sleep(2)
+            # Debug: Get page title and URL to understand where we are
+            current_url = self.page.url
+            page_title = await self.page.title()
+            logger.info(f"Current URL: {current_url}")
+            logger.info(f"Page title: {page_title}")
             
-            # Check for and close any popups that might be visible
-            try:
-                # Look for various close buttons in popups
-                popup_close_selectors = [
-                    'button:has-text("Close")',
-                    '.close-button',
-                    '.modal-close',
-                    '.popup-close',
-                    'span.close',
-                    'button.btn-close'
-                ]
+            # Check if we're redirected to login page
+            if "login.propstream.com" in current_url or "login" in page_title.lower():
+                logger.info("Detected session expiration - re-logging in")
+                if not await self.login():
+                    logger.error("Failed to re-login, aborting import")
+                    return None
+                    
+                # Try navigating to contacts page again after re-login
+                logger.info("Re-navigating to contacts page after login")
+                await self.page.goto(f"{self.base_url}/contact", wait_until="networkidle")
+                await asyncio.sleep(3)
                 
-                for selector in popup_close_selectors:
-                    try:
-                        # Check if the selector exists and is visible
-                        close_button = await self.page.query_selector(selector)
-                        if close_button:
-                            is_visible = await close_button.is_visible()
-                            if is_visible:
-                                logger.info(f"Found popup close button with selector: {selector}")
-                                await close_button.click()
-                                logger.info("Clicked close button on popup")
-                                # Wait a moment for the popup to close
-                                await asyncio.sleep(1)
-                                break
-                    except Exception as e:
-                        logger.debug(f"Could not interact with close button selector {selector}: {str(e)}")
-            except Exception as e:
-                logger.warning(f"Error handling popups: {str(e)}")
-            
-            # Try multiple selectors for the "Import List" button
-            logger.info("Looking for 'Import List' button")
-            import_button_selectors = [
-                'div.src-components-Button-style__FABy8__content:text("Import List")',
-                'button:has-text("Import List")',
-                'span:text("Import List")',
-                '[data-testid="import-list-button"]',
-                '.import-list-btn',
-                'div:text("Import List"):visible',
-                'div.src-app-utils-Button-style__jfMOa__content:text("Import List")',
-                'div[class*="Button-style"]:has-text("Import List")'
-            ]
-            
-            # Take screenshot of the UI
-            await self.page.screenshot(path="before_import_button_click.png")
-            
-            button_found = False
-            for selector in import_button_selectors:
-                try:
-                    element = await self.page.query_selector(selector)
-                    if element:
-                        is_visible = await element.is_visible()
-                        if is_visible:
-                            logger.info(f"Found 'Import List' button with selector: {selector}")
-                            await element.click(timeout=10000)
-                            button_found = True
-                            logger.info(f"Clicked 'Import List' button with selector: {selector}")
-                            break
-                except Exception as e:
-                    logger.warning(f"Could not click button with selector {selector}: {str(e)}")
-            
-            if not button_found:
-                # Search for any button that might contain "Import" or "List"
-                logger.info("Trying to find Import List button by examining all buttons")
-                buttons = await self.page.query_selector_all('button, div[role="button"], [class*="button"], [class*="Button"]')
+                # Take another screenshot to verify
+                await self.page.screenshot(path="contacts_page_after_relogin.png")
                 
-                for button in buttons:
-                    try:
-                        # Check if the button is visible
-                        is_visible = await button.is_visible()
-                        if not is_visible:
-                            continue
-                            
-                        button_text = await button.inner_text()
-                        logger.info(f"Found button with text: {button_text}")
-                        
-                        # Check if the text contains "import" or "list" (case insensitive)
-                        if "import" in button_text.lower() or "list" in button_text.lower():
-                            logger.info(f"Clicking button with text: {button_text}")
-                            await button.click()
-                            button_found = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"Error examining button: {str(e)}")
-                
-            if not button_found:
-                # Take a screenshot to help debug the issue
-                await self.page.screenshot(path="import_button_not_found.png")
-                
-                # Try clicking on the first navigation element that might lead to the import page
-                try:
-                    sidebar_buttons = await self.page.query_selector_all('a[href], div[role="link"], [class*="navigation"], [class*="sidebar"]')
-                    for button in sidebar_buttons:
-                        try:
-                            is_visible = await button.is_visible()
-                            if is_visible:
-                                button_text = await button.inner_text()
-                                logger.info(f"Trying sidebar element with text: {button_text}")
-                                if "lead" in button_text.lower() or "import" in button_text.lower() or "contact" in button_text.lower():
-                                    await button.click()
-                                    logger.info(f"Clicked sidebar element: {button_text}")
-                                    await asyncio.sleep(2)
-                                    # Now try again to find the Import List button
-                                    for selector in import_button_selectors:
-                                        try:
-                                            if await self.page.query_selector(selector):
-                                                await self.page.click(selector, timeout=5000)
-                                                logger.info(f"Found Import List button after navigation")
-                                                button_found = True
-                                                break
-                                        except Exception:
-                                            continue
-                                    if button_found:
-                                        break
-                        except Exception:
-                            continue
-                except Exception as e:
-                    logger.warning(f"Error trying sidebar navigation: {str(e)}")
-            
-            if not button_found:
-                logger.error("Could not find or click 'Import List' button")
-                await self.page.screenshot(path="import_button_not_found_final.png")
-                
-                # As a last resort, try to use the direct URL for importing
-                try:
-                    logger.info("Trying to navigate directly to import URL")
-                    await self.page.goto(f"{self.base_url}/import", wait_until="networkidle")
-                    # Check if we're on an import page
-                    if "import" in self.page.url.lower():
-                        logger.info("Successfully navigated to import page via direct URL")
-                        button_found = True
-                    else:
-                        logger.warning("Direct URL navigation did not reach import page")
-                except Exception as e:
-                    logger.error(f"Error navigating to direct import URL: {str(e)}")
+                # Double-check URL again
+                current_url = self.page.url
+                if "login.propstream.com" in current_url:
+                    logger.error("Still on login page after re-login attempt, aborting")
                     return None
             
-            if not button_found:
-                return None
+            # Handle any popups that might be blocking the UI
+            await self.handle_all_popups()
             
-            logger.info("Clicked 'Import List' button, waiting for file upload dialog")
+            # Look for buttons that might be related to import functionality
+            logger.info("Looking for import-related buttons on the page")
             
-            # Wait for the file upload dialog to appear
-            await self.page.wait_for_selector('input[type="file"]', state="attached", timeout=20000)
+            # First, take a screenshot of the whole page
+            await self.page.screenshot(path="contacts_page_before_searching.png")
             
-            # Use the file input to upload the file
-            logger.info(f"Uploading file: {file_path}")
-            input_file = await self.page.query_selector('input[type="file"]')
-            await input_file.set_input_files(file_path)
-            
-            # Wait for the file to upload and show in the UI
-            try:
-                await self.page.wait_for_selector(f'div:text("{os.path.basename(file_path)}")', timeout=30000)
-                logger.info("File uploaded successfully")
-            except TimeoutError:
-                logger.warning("File name not visible in UI, but proceeding")
-            
-            # Take screenshot after file upload
-            await self.page.screenshot(path="file_uploaded.png")
-            
-            # Select "Create New" radio button
-            try:
-                await self.page.click('input[value="new"]', timeout=10000)
-                logger.info("Selected 'Create New' option")
-            except Exception as e:
-                logger.warning(f"Could not click 'Create New' radio button: {str(e)}")
-                # Try alternative selectors
-                selectors = [
-                    'label:has-text("Create New")',
-                    'div:has-text("Create New") input',
-                    '[value="new"]'
-                ]
-                for selector in selectors:
-                    try:
-                        await self.page.click(selector, timeout=5000)
-                        logger.info(f"Selected 'Create New' using selector: {selector}")
-                        break
-                    except Exception:
-                        continue
-            
-            # Generate a group name with timestamp to ensure uniqueness
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            group_name = f"Foreclosures_scraping_Test_{timestamp}"
-            
-            # Wait for the "Add To Group" dialog box
-            logger.info("Waiting for 'Add To Group' dialog")
-            try:
-                await self.page.wait_for_selector('input[placeholder="New Group"]', timeout=15000)
-            except TimeoutError:
-                logger.warning("New Group input not found with expected selector")
-                # Try alternative selectors
-                selectors = [
-                    'input[placeholder*="Group"]',
-                    'input[placeholder="Add a name"]',
-                    'input.new-group-input'
-                ]
-                for selector in selectors:
-                    try:
-                        await self.page.wait_for_selector(selector, timeout=5000)
-                        logger.info(f"Found group name input with selector: {selector}")
-                        # Update the selector for the next step
-                        new_group_selector = selector
-                        break
-                    except TimeoutError:
-                        continue
-                else:
-                    # Take screenshot if we can't find the input
-                    await self.page.screenshot(path="group_input_not_found.png")
-                    logger.error("Could not find group name input with any selector")
-                    return None
-            
-            # Enter the new group name
-            logger.info(f"Setting group name: {group_name}")
-            try:
-                await self.page.fill('input[placeholder="New Group"]', group_name)
-            except Exception:
-                # Use the alternative selector if we found one
-                if 'new_group_selector' in locals():
-                    await self.page.fill(new_group_selector, group_name)
-                else:
-                    # Try to find any input field that might be for the group name
-                    inputs = await self.page.query_selector_all('input:visible')
-                    for input_elem in inputs:
-                        try:
-                            placeholder = await input_elem.get_attribute('placeholder')
-                            if placeholder and ('group' in placeholder.lower() or 'name' in placeholder.lower()):
-                                await input_elem.fill(group_name)
-                                logger.info(f"Filled group name in input with placeholder: {placeholder}")
-                                break
-                        except Exception:
-                            continue
-            
-            # Click the "Save" button
-            logger.info("Clicking 'Save' button")
-            save_selectors = [
-                'button[type="submit"]:has-text("Save")',
-                'button:has-text("Save")',
-                '.save-button',
-                '[data-testid="save-button"]'
+            # Look for a menu button or dropdown that might contain the Import option
+            menu_button_found = False
+            menu_button_selectors = [
+                'button.menu',
+                'button.dropdown',
+                'button:has([class*="menu-icon"])',
+                'button:has([class*="ellipsis"])',
+                'button:has([class*="more"])',
+                'button:has([class*="actions"])',
+                'button:has([class*="options"])',
+                '[aria-label="Menu"]',
+                '[aria-label="Options"]',
+                '[aria-label="Actions"]',
+                'button:has(svg)',  # Many menu buttons have SVG icons
+                '[data-testid="menu"]',
+                '[data-testid="options"]'
             ]
             
-            save_clicked = False
-            for selector in save_selectors:
+            for selector in menu_button_selectors:
                 try:
-                    if await self.page.query_selector(selector):
-                        await self.page.click(selector, timeout=5000)
-                        save_clicked = True
-                        logger.info(f"Clicked Save with selector: {selector}")
-                        break
-                except Exception:
-                    continue
-            
-            if not save_clicked:
-                # Try to find any button that might be the save button
-                buttons = await self.page.query_selector_all('button:visible')
-                for button in buttons:
-                    try:
-                        button_text = await button.inner_text()
-                        if "save" in button_text.lower() or "done" in button_text.lower() or "ok" in button_text.lower():
+                    menu_buttons = await self.page.query_selector_all(selector)
+                    for button in menu_buttons:
+                        if await button.is_visible():
+                            logger.info(f"Found potential menu button with selector: {selector}")
                             await button.click()
-                            save_clicked = True
-                            logger.info(f"Clicked button with text: {button_text}")
+                            menu_button_found = True
+                            logger.info("Clicked menu button")
+                            await asyncio.sleep(2)
+                            await self.page.screenshot(path="after_menu_button_click.png")
                             break
-                    except Exception:
-                        continue
+                    if menu_button_found:
+                        break
+                except Exception as e:
+                    logger.debug(f"Error with menu selector {selector}: {str(e)}")
             
-            if not save_clicked:
-                await self.page.screenshot(path="save_button_not_found.png")
-                logger.warning("Could not find or click 'Save' button")
+            # Look for action buttons and icons that might be Add/Import buttons
+            action_button_found = False
+            action_button_selectors = [
+                'button:has-text("+")',
+                'button[aria-label="Add"]',
+                'button[title="Add"]',
+                'button:has(svg[class*="add"])',
+                'button:has(svg[class*="plus"])',
+                'button:has([class*="add-icon"])',
+                'button:has([class*="plus-icon"])',
+                '[data-testid="add-button"]',
+                '[data-testid="add-contact"]',
+                'button.add-button',
+                'button.add-contact',
+                'div[role="button"]:has-text("+")'
+            ]
             
-            # Wait for the import to complete - look for success indicators
-            try:
-                await self.page.wait_for_selector('div:text("Import completed")', timeout=120000)
-                logger.info("Import completed successfully")
-            except TimeoutError:
-                logger.warning("Import completion message not found, but proceeding")
-                
-                # Check if we're back on the main page
+            for selector in action_button_selectors:
                 try:
-                    main_page_indicators = [
-                        'div.src-components-Button-style__FABy8__content:text("Import List")',
-                        'button:has-text("Import List")',
-                        'div.dashboard-container',
-                        'div.main-content'
+                    action_buttons = await self.page.query_selector_all(selector)
+                    for button in action_buttons:
+                        if await button.is_visible():
+                            logger.info(f"Found potential add/action button with selector: {selector}")
+                            await button.click()
+                            action_button_found = True
+                            logger.info("Clicked add/action button")
+                            await asyncio.sleep(2)
+                            await self.page.screenshot(path="after_action_button_click.png")
+                            break
+                    if action_button_found:
+                        break
+                except Exception as e:
+                    logger.debug(f"Error with action selector {selector}: {str(e)}")
+            
+            # After clicking menu or action buttons, try to find Import or Upload options
+            import_option_found = False
+            import_option_selectors = [
+                'li:has-text("Import")',
+                'div:has-text("Import")',
+                'a:has-text("Import")',
+                'button:has-text("Import")',
+                'li:has-text("Upload")',
+                'div:has-text("Upload")',
+                'a:has-text("Upload")',
+                'button:has-text("Upload")',
+                '[data-testid*="import"]',
+                '[data-testid*="upload"]'
+            ]
+            
+            for selector in import_option_selectors:
+                try:
+                    import_options = await self.page.query_selector_all(selector)
+                    for option in import_options:
+                        if await option.is_visible():
+                            logger.info(f"Found potential import option with selector: {selector}")
+                            await option.click()
+                            import_option_found = True
+                            logger.info("Clicked import option")
+                            await asyncio.sleep(3)
+                            await self.page.screenshot(path="after_import_option_click.png")
+                            break
+                    if import_option_found:
+                        break
+                except Exception as e:
+                    logger.debug(f"Error with import option selector {selector}: {str(e)}")
+            
+            # Check for the upload dialog immediately after clicking any of these options
+            upload_dialog_visible = await self.check_for_upload_dialog()
+            
+            # If we found the dialog, proceed with upload
+            if upload_dialog_visible:
+                logger.info("Successfully found file upload dialog")
+                
+                # Wait a bit to let the dialog fully appear
+                await asyncio.sleep(2)
+                
+                # Look for the file input element
+                file_input = await self.page.query_selector('input[type="file"]')
+                
+                if file_input:
+                    # Use the file input to upload the file
+                    logger.info(f"Uploading file: {file_path}")
+                    await file_input.set_input_files(file_path)
+                    
+                    # Wait for the file to be processed
+                    await asyncio.sleep(5)
+                    await self.page.screenshot(path="after_file_upload.png")
+                    
+                    # Look for and click any "Continue" or "Next" buttons
+                    continue_button_selectors = [
+                        'button:has-text("Continue")',
+                        'button:has-text("Next")',
+                        'button:has-text("Upload")',
+                        'button:has-text("Submit")',
+                        'button:has-text("Import")',
+                        'button[type="submit"]'
                     ]
                     
-                    for indicator in main_page_indicators:
+                    for selector in continue_button_selectors:
                         try:
-                            if await self.page.wait_for_selector(indicator, timeout=5000):
-                                logger.info(f"Returned to main page, detected with: {indicator}")
+                            continue_button = await self.page.query_selector(selector)
+                            if continue_button and await continue_button.is_visible():
+                                logger.info(f"Found continue button with selector: {selector}")
+                                await continue_button.click()
+                                logger.info("Clicked continue button")
+                                await asyncio.sleep(3)
+                                await self.page.screenshot(path="after_continue_click.png")
                                 break
-                        except TimeoutError:
-                            continue
-                except Exception:
-                    logger.warning("Not on main page, but continuing")
+                        except Exception as e:
+                            logger.debug(f"Error with continue button selector {selector}: {str(e)}")
+                    
+                    # Now check for the group creation dialog
+                    group_dialog_found = await self.check_for_group_dialog()
+                    
+                    if group_dialog_found:
+                        # Generate a group name with timestamp for uniqueness
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        group_name = f"Foreclosures_{timestamp}"
+                        
+                        # Fill in the group name
+                        group_name_filled = await self.fill_group_name(group_name)
+                        
+                        if group_name_filled:
+                            # Click save button
+                            save_clicked = await self.click_save_button()
+                            
+                            if save_clicked:
+                                # Wait for import to complete
+                                await self.wait_for_import_completion()
+                                
+                                # Save the group name for later use
+                                self.group_name = group_name
+                                logger.info(f"Group created with name: {group_name}")
+                                
+                                return group_name
+                            else:
+                                logger.error("Could not find or click save button")
+                        else:
+                            logger.error("Could not fill in group name")
+                    else:
+                        logger.error("Could not find group creation dialog")
+                else:
+                    logger.error("File input element not found in upload dialog")
+            else:
+                logger.error("Could not find file upload dialog after clicking import options")
             
-            # Take a final screenshot
-            await self.page.screenshot(path="after_import.png")
+            # If we get here, we've tried various methods but haven't succeeded
+            # Let's try direct navigation to import URLs as a last resort
+            potential_urls = [
+                f"{self.base_url}/contact/import",
+                f"{self.base_url}/contact/upload",
+                f"{self.base_url}/import",
+                f"{self.base_url}/upload"
+            ]
             
-            # Save the group name for later use
-            self.group_name = group_name
-            logger.info(f"Group created with name: {group_name}")
+            for url in potential_urls:
+                logger.info(f"Trying direct navigation to {url}")
+                try:
+                    await self.page.goto(url, wait_until="networkidle")
+                    await asyncio.sleep(3)
+                    await self.page.screenshot(path=f"direct_url_{url.split('/')[-1]}.png")
+                    
+                    # Check if this URL has a file input
+                    if await self.check_for_upload_dialog():
+                        logger.info(f"Found upload dialog at {url}")
+                        
+                        # Try to upload the file
+                        file_input = await self.page.query_selector('input[type="file"]')
+                        if file_input:
+                            logger.info(f"Uploading file through direct URL: {file_path}")
+                            await file_input.set_input_files(file_path)
+                            await asyncio.sleep(5)
+                            await self.page.screenshot(path=f"file_uploaded_at_{url.split('/')[-1]}.png")
+                            
+                            # Rest of the import process...
+                            # Generate a unique group name
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            group_name = f"Foreclosures_{timestamp}"
+                            
+                            # Try to find group creation options
+                            if await self.check_for_group_dialog():
+                                if await self.fill_group_name(group_name) and await self.click_save_button():
+                                    await self.wait_for_import_completion()
+                                    self.group_name = group_name
+                                    logger.info(f"Group created with name: {group_name}")
+                                    return group_name
+                            
+                            # Even if we can't complete the full flow, return the group name
+                            # in case it was created automatically
+                            self.group_name = group_name
+                            return group_name
+                    
+                except Exception as e:
+                    logger.warning(f"Error navigating to {url}: {str(e)}")
             
-            return group_name
+            logger.error("All attempts to import file failed")
+            return None
             
         except Exception as e:
             logger.error(f"Error importing file: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             await self.page.screenshot(path="import_error.png")
             return None
+    
+    async def check_for_group_dialog(self):
+        """Check if the group creation dialog is visible"""
+        logger.info("Checking for group creation dialog")
+        await self.page.screenshot(path="before_group_dialog_check.png")
+        
+        # Wait a bit for the dialog to appear
+        await asyncio.sleep(2)
+        
+        group_dialog_selectors = [
+            'div:has-text("Create New Group")',
+            'div:has-text("Add to Group")',
+            'div:has-text("Select Group")',
+            'div:has-text("Group Name")',
+            'input[placeholder*="group" i]',
+            'input[placeholder*="name" i]',
+            'input.new-group-input',
+            'input[name="groupName"]',
+            'div.group-selection',
+            'div.group-creation',
+            'div[role="dialog"]',
+            'div.modal'
+        ]
+        
+        for selector in group_dialog_selectors:
+            try:
+                element = await self.page.query_selector(selector)
+                if element and await element.is_visible():
+                    logger.info(f"Found group dialog element with selector: {selector}")
+                    return True
+            except Exception as e:
+                logger.debug(f"Error checking selector {selector}: {str(e)}")
+        
+        # Use JavaScript to look for group dialog indicators
+        js_found_group_dialog = await self.page.evaluate('''() => {
+            const bodyText = document.body.innerText.toLowerCase();
+            return bodyText.includes('create new group') || 
+                   bodyText.includes('add to group') || 
+                   bodyText.includes('select group') || 
+                   bodyText.includes('group name');
+        }''')
+        
+        if js_found_group_dialog:
+            logger.info("JavaScript found text indicating group dialog")
+            return True
+            
+        logger.info("No group creation dialog found")
+        return False
+    
+    async def close_any_popups(self):
+        """Close any visible popups or modals"""
+        # Use the more comprehensive method
+        await self.handle_all_popups()
+        
+        # Also check for permission prompts
+        await self.handle_permission_prompts()
+    
+    async def select_create_new_option(self):
+        """Select the 'Create New' radio option"""
+        logger.info("Looking for 'Create New' radio option")
+        create_new_selectors = [
+            'input[value="new"]',
+            'label:has-text("Create New")',
+            'div:has-text("Create New") input',
+            'input#create-new',
+            'input[name="groupRadio"][value="new"]',
+            'input[type="radio"]:below(label:has-text("Create New"))',
+            'input[type="radio"]:near(:text("Create New"))',
+            'label:has-text("Create New") input'
+        ]
+        
+        create_new_selected = False
+        for selector in create_new_selectors:
+            try:
+                element = await self.page.query_selector(selector)
+                if element:
+                    logger.info(f"Found 'Create New' radio button with selector: {selector}")
+                    await element.click(timeout=5000)
+                    create_new_selected = True
+                    logger.info(f"Selected 'Create New' using selector: {selector}")
+                    await asyncio.sleep(1)
+                    await self.page.screenshot(path="after_create_new_selected.png")
+                    break
+            except Exception as e:
+                logger.debug(f"Could not click 'Create New' with selector {selector}: {str(e)}")
+        
+        # If we couldn't find the selector, try examining all radio buttons
+        if not create_new_selected:
+            logger.info("Trying to find 'Create New' by examining all radio buttons")
+            
+            # List all radio buttons
+            radio_buttons = await self.page.query_selector_all('input[type="radio"]')
+            logger.info(f"Found {len(radio_buttons)} radio buttons on the page")
+            
+            for i, radio in enumerate(radio_buttons):
+                try:
+                    # Check if it's visible
+                    if not await radio.is_visible():
+                        continue
+                        
+                    # Try to get the label or text near this radio
+                    radio_id = await radio.get_attribute('id')
+                    if radio_id:
+                        label_selector = f'label[for="{radio_id}"]'
+                        label = await self.page.query_selector(label_selector)
+                        if label:
+                            label_text = await label.inner_text()
+                            logger.info(f"Radio {i+1} has label: '{label_text}'")
+                            
+                            if "create" in label_text.lower() or "new" in label_text.lower():
+                                logger.info(f"Clicking radio with label: '{label_text}'")
+                                await radio.click()
+                                create_new_selected = True
+                                await asyncio.sleep(1)
+                                await self.page.screenshot(path="after_radio_click.png")
+                                break
+                except Exception as e:
+                    logger.debug(f"Error examining radio button {i+1}: {str(e)}")
+        
+        return create_new_selected
+    
+    async def fill_group_name(self, group_name):
+        """Fill in the group name input field"""
+        logger.info(f"Trying to fill group name: {group_name}")
+        group_input_selectors = [
+            'input[placeholder="New Group"]',
+            'input[placeholder*="group" i]',
+            'input[placeholder*="name" i]',
+            'input.new-group-input',
+            'input[name="groupName"]',
+            'input[id*="group" i][type="text"]',
+            'input[id*="name" i][type="text"]',
+            'input[type="text"]:near(:text("Group"))',
+            'input[type="text"]:near(:text("Name"))'
+        ]
+        
+        group_input_found = False
+        for selector in group_input_selectors:
+            try:
+                element = await self.page.query_selector(selector)
+                if element and await element.is_visible():
+                    logger.info(f"Found group name input with selector: {selector}")
+                    await element.fill(group_name)
+                    logger.info(f"Set group name to: {group_name}")
+                    group_input_found = True
+                    await asyncio.sleep(1)
+                    await self.page.screenshot(path="after_group_name_filled.png")
+                    break
+            except Exception as e:
+                logger.debug(f"Error with selector {selector}: {str(e)}")
+        
+        if not group_input_found:
+            # As a fallback, try to find any visible text input on the page
+            logger.info("Looking for any text input fields")
+            inputs = await self.page.query_selector_all('input[type="text"]:visible')
+            logger.info(f"Found {len(inputs)} visible text inputs")
+            
+            # Try each visible text input
+            for i, input_elem in enumerate(inputs):
+                try:
+                    # Check attributes that might indicate this is the group name input
+                    placeholder = await input_elem.get_attribute('placeholder') or ""
+                    name = await input_elem.get_attribute('name') or ""
+                    id = await input_elem.get_attribute('id') or ""
+                    
+                    logger.info(f"Text input {i+1}: placeholder='{placeholder}', name='{name}', id='{id}'")
+                    
+                    # Skip inputs that are clearly not for group name
+                    if any(word in (placeholder + name + id).lower() for word in [
+                        "search", "filter", "email", "password", "phone", "address"
+                    ]):
+                        continue
+                    
+                    # Try to fill this input
+                    await input_elem.fill(group_name)
+                    logger.info(f"Filled potential group name input {i+1} with: {group_name}")
+                    group_input_found = True
+                    await asyncio.sleep(1)
+                    await self.page.screenshot(path=f"after_filling_input_{i+1}.png")
+                    break
+                except Exception as e:
+                    logger.debug(f"Error examining input {i+1}: {str(e)}")
+        
+        return group_input_found
+    
+    async def click_save_button(self):
+        """Find and click the save/continue/import button"""
+        logger.info("Looking for Save/Submit/Import button")
+        save_button_selectors = [
+            'button[type="submit"]',
+            'button:has-text("Save")',
+            'button:has-text("Submit")',
+            'button:has-text("Import")',
+            'button:has-text("Continue")',
+            'button:has-text("Next")',
+            'button:has-text("Done")',
+            '.save-button',
+            '[data-testid="save-button"]',
+            '[data-testid="submit-button"]',
+            '[data-testid="continue-button"]',
+            'div[role="button"]:has-text("Save")',
+            'div[role="button"]:has-text("Submit")',
+            'div[role="button"]:has-text("Import")',
+            'div[role="button"]:has-text("Continue")',
+            'div[role="button"]:has-text("Next")'
+        ]
+        
+        save_clicked = False
+        for selector in save_button_selectors:
+            try:
+                elements = await self.page.query_selector_all(selector)
+                for element in elements:
+                    if await element.is_visible():
+                        button_text = await element.inner_text()
+                        logger.info(f"Found potential save button: '{button_text}'")
+                        
+                        # Skip if it contains text suggesting it's not what we want
+                        if any(word in button_text.lower() for word in ["cancel", "back", "close"]):
+                            continue
+                            
+                        await element.click(timeout=5000)
+                        save_clicked = True
+                        logger.info(f"Clicked button with text: '{button_text}'")
+                        await asyncio.sleep(1)
+                        await self.page.screenshot(path="after_save_click.png")
+                        break
+                
+                if save_clicked:
+                    break
+            except Exception as e:
+                logger.debug(f"Could not click with selector {selector}: {str(e)}")
+        
+        if not save_clicked:
+            # Try to find any button that might be the save button
+            logger.info("Looking for any button that might confirm the operation")
+            buttons = await self.page.query_selector_all('button:visible, div[role="button"]:visible')
+            logger.info(f"Found {len(buttons)} visible buttons")
+            
+            for i, button in enumerate(buttons):
+                try:
+                    button_text = await button.inner_text()
+                    logger.info(f"Button {i+1} text: '{button_text}'")
+                    
+                    if any(keyword in button_text.lower() for keyword in [
+                        "save", "done", "submit", "import", "ok", "continue", "next", "create"
+                    ]) and not any(keyword in button_text.lower() for keyword in [
+                        "cancel", "back", "close"
+                    ]):
+                        logger.info(f"Clicking button {i+1} with text: '{button_text}'")
+                        await button.click()
+                        save_clicked = True
+                        await asyncio.sleep(1)
+                        await self.page.screenshot(path=f"after_clicking_button_{i+1}.png")
+                        break
+                except Exception as e:
+                    logger.debug(f"Error examining button {i+1}: {str(e)}")
+        
+        return save_clicked
+    
+    async def wait_for_import_completion(self):
+        """Wait for the import process to complete"""
+        logger.info("Waiting for import to complete...")
+        
+        # Take screenshots at intervals to track progress
+        for i in range(1, 7):
+            await asyncio.sleep(5)
+            await self.page.screenshot(path=f"import_progress_{i}.png")
+            
+            # Check for completion indicators
+            completion_indicators = [
+                'div:text("Import completed")',
+                'div:text("Import successful")',
+                'div:text("Group created")',
+                '.success-message',
+                '[data-testid="import-success"]'
+            ]
+            
+            for selector in completion_indicators:
+                try:
+                    element = await self.page.query_selector(selector)
+                    if element and await element.is_visible():
+                        message = await element.inner_text()
+                        logger.info(f"Found import completion message: '{message}'")
+                        return True
+                except Exception:
+                    continue
+            
+            # Check URL for indication we've returned to the contacts page
+            if "/contact" in self.page.url and not "/import" in self.page.url:
+                logger.info("Returned to contacts page, which suggests import completed")
+                return True
+                
+        logger.warning("Did not find explicit import completion message, but continuing")
+        return False
     
     async def navigate_to_skip_tracing(self):
         """Navigate to the skip tracing page"""
